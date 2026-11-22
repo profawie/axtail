@@ -194,13 +194,16 @@ impl App {
     pub fn new(scan: Scan, grep: Option<Matcher>, tail: usize) -> App {
         let (tx, rx) = mpsc::channel();
         let grep = grep.map(Arc::new);
+        let docker = scan.sources.iter().any(|s| s.is_docker());
         let mut app = App {
             title: scan.title,
             counts: vec![Count::Pending; scan.sources.len()],
             order: Vec::new(),
             sources: scan.sources,
             sel: 0,
-            sort: Sort::Name,
+            // In a container there are often hundreds of rotated files:
+            // show the most recent first.
+            sort: if docker { Sort::Newest } else { Sort::Name },
             name_filter: String::new(),
             last_mode: grep.as_ref().map_or(Mode::Text, |m| m.mode),
             last_query: grep.as_ref().map_or(String::new(), |m| m.query.clone()),
@@ -259,7 +262,10 @@ impl App {
             .collect();
         let s = &self.sources;
         match self.sort {
-            Sort::Name => {} // discovery order is already sorted by path
+            // Natural order on the full path keeps each folder together.
+            Sort::Name => {
+                order.sort_by(|&a, &b| crate::source::natural_cmp(&s[a].name, &s[b].name))
+            }
             Sort::Newest => order.sort_by(|&a, &b| s[b].modified.cmp(&s[a].modified)),
             Sort::Largest => order.sort_by(|&a, &b| s[b].size.cmp(&s[a].size)),
             Sort::Matches => {
@@ -270,6 +276,8 @@ impl App {
                 order.sort_by_key(|&i| std::cmp::Reverse(n(i)));
             }
         }
+        // The live `docker logs` stream always stays at the top.
+        order.sort_by_key(|&i| !self.sources[i].is_docker_logs());
         self.order = order;
         self.sel = self.sel.min(self.order.len().saturating_sub(1));
     }

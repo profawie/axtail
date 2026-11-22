@@ -5,7 +5,7 @@ It helps you find the root cause in log files over SSH: plain files, gzip, zip
 and Docker container logs, all in one coloured text interface.
 
 ```
- axtail 0.1.0 - /var/log/app
+ axtail 0.1.1 - /var/log/app
 ┌ text ──────────────────────────────────── 260.4 MB / 521.8 MB (49%) ┐
 │2026-11-22T06:19:59Z ERROR [worker-15] request id=2999999 took 609ms │
 │2026-11-22 FATAL database connection pool exhausted                  │
@@ -201,13 +201,32 @@ Run the tests with `cargo test`.
 
 ## Docker notes
 
-- `axtail --docker NAME` runs `docker logs --tail N -f NAME` for live view and
-  `docker logs NAME` for search. stdout and stderr are merged.
-- Files inside a container are listed with `docker exec NAME ls` and read with
-  `cat` / `tail`, so the image needs those tools. Zip files inside containers are not supported.
+- `axtail --docker NAME` lists the container's live `docker logs` stream first, followed by
+  the log files found **inside** the container, newest first. Archived logs are included:
+  `.gz` files are stream-decompressed and `.zip` files are read as a stream, with each
+  entry shown after a `==> name <==` line.
+- Without a filter, these folders are searched recursively (up to 8 levels deep, one
+  filesystem, skipping `node_modules`, `.git` and similar): `/var/log`, `/opt`, `/app`,
+  `/srv`, `/data`, `/logs`, `/log`, `/var/www`, `/usr/src/app`, `/home` and the container's
+  working directory. A file counts as a log when it is `*.log`, a rotated `*.log.*`,
+  `*.out`, anything under `/var/log`, or a `.txt`, `.gz` or `.zip` in a path containing "log".
+- A filter narrows the search:
+
+  | Filter | Lists |
+  | --- | --- |
+  | `'*.gz'`, `'prod.2026-11-21*'` | files with that name, anywhere in the folders above |
+  | `'/opt/app/logs/*.zip'` | files with that name under one folder, recursively |
+  | `/opt/app/logs` | every file under that folder (or that one file) |
+
+- In the list, `Left`/`Right` switches between newest first and by name (grouped by
+  folder, with numbers in natural order), and `Ctrl+F` filters by name, for example `11-21`.
+- The scan is one `docker exec NAME sh -c "find ... | head"` call: read-only, at most
+  20,000 files, and only file names, sizes and dates are read. A log's content is read
+  only when you open it, with `cat` or `tail -F`. The image needs `sh` and `find`
+  (BusyBox is fine). `stat` is optional; without it sizes and dates show as `-`.
 - Set `AXTAIL_DOCKER` to use another binary, for example `AXTAIL_DOCKER=podman`.
 
-## Limitations in 0.1.0
+## Limitations
 
 - Wildcards are supported in the file name only, not in directory names, and directories
   are not scanned recursively.
