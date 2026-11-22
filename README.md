@@ -103,6 +103,19 @@ Requires a [Rust toolchain](https://rustup.rs) (1.87 or newer).
 .\run.ps1 C:\logs
 ```
 
+**Windows without Visual Studio.** Only [rustup](https://rustup.rs) is required.
+`build.ps1` uses the MSVC toolchain when the Visual Studio C++ build tools are installed
+and otherwise falls back to the GNU toolchain (`stable-x86_64-pc-windows-gnu`), which
+rustup downloads together with its own linker. No MinGW installation is needed, and all
+dependencies are pure Rust. To force a toolchain:
+
+```powershell
+.\build.ps1 -Toolchain gnu    # never needs Visual Studio
+.\build.ps1 -Toolchain msvc
+```
+
+If rustup asks about Visual Studio during installation, choose to continue without it.
+
 Run the tests with `cargo test`.
 
 ## How it stays light on the server
