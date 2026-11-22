@@ -98,6 +98,19 @@ Requires a [Rust toolchain](https://rustup.rs) (1.87 or newer).
 ./run.sh /var/log   # builds if needed, then runs
 ```
 
+**Portable Linux binary.** On Linux, `build.sh` builds a fully static binary (musl) by
+default. It does not depend on the system glibc, so a binary built on one machine (for
+example Debian 13) can be copied to any other Linux server of the same CPU architecture,
+such as Ubuntu 20.04 or newer, RHEL or Alpine, and just run. The script adds the rustup
+target itself; the only system requirement is a C linker (`sudo apt install build-essential`
+on Debian/Ubuntu). No `musl-tools` package is needed.
+
+```sh
+./build.sh            # static, portable (default)
+./build.sh --native   # normal build against this machine's glibc
+scp ./axtail user@server:/usr/local/bin/
+```
+
 ```powershell
 .\build.ps1         # Windows: builds .\axtail.exe in the repository root
 .\run.ps1 C:\logs
