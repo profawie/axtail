@@ -1,0 +1,23 @@
+[package]
+name = "axtail"
+version = "0.1.0"
+edition = "2024"
+description = "Advanced tail: a fast, read-only terminal log viewer for plain, gzip, zip and Docker logs"
+repository = "https://github.com/profawie/axtail"
+readme = "README.md"
+keywords = ["tail", "log", "tui", "docker", "sysadmin"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+flate2 = "1.1.11"
+memchr = "2.8.3"
+ratatui = "0.30.2"
+regex = "1.13.2"
+zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
