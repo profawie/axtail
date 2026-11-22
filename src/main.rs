@@ -23,8 +23,11 @@ FILTER:
     inside is listed. Quote wildcards to let axtail expand them itself.
 
 OPTIONS:
-    --docker <CONTAINER>   Read a container's logs through `docker logs`.
-                           With a FILTER, also list files inside the container.
+    --docker <CONTAINER>   Read a container's logs through `docker logs`, and
+                           list log files inside the container, including
+                           .gz and .zip archives. Without a FILTER the usual
+                           log folders are searched (/var/log, /opt, /app,
+                           /srv, /data, /home, the workdir, ...).
     --grep <PATTERN>       Advanced search: start with a regex already active
                            and show the match count of every file in the list.
     -i, --ignore-case      Make --grep case-insensitive.
@@ -41,6 +44,7 @@ EXAMPLES:
     axtail app.log.gz                    Stream-decompressed gzip
     axtail --docker myapp                Live container logs
     axtail --docker myapp '/var/log/*.log'
+    axtail --docker myapp '*.gz'           Archived logs anywhere in the usual folders
     axtail --docker myapp --grep 'panic'
 
 KEYS:
@@ -126,7 +130,10 @@ fn main() -> ExitCode {
         },
     };
     let scan = match &args.docker {
-        Some(c) => source::scan_docker(c, &args.filters),
+        Some(c) => {
+            eprintln!("axtail: looking for log files in container {c}...");
+            source::scan_docker(c, &args.filters)
+        }
         None => source::scan_local(&args.filters),
     };
     if scan.sources.is_empty() {

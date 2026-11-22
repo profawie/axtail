@@ -32,8 +32,26 @@ pub enum Kind {
     DockerFile {
         container: String,
         path: String,
-        gz: bool,
+        comp: Comp,
     },
+}
+
+/// Compression of a file inside a container.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Comp {
+    None,
+    Gzip,
+    Zip,
+}
+
+impl Comp {
+    fn of(path: &str) -> Comp {
+        match lower_ext(path).as_str() {
+            "gz" | "gzip" => Comp::Gzip,
+            "zip" => Comp::Zip,
+            _ => Comp::None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -114,7 +132,16 @@ impl Source {
     }
 
     pub fn can_live(&self) -> bool {
-        self.plain_path().is_some() || self.is_docker()
+        match &self.kind {
+            Kind::Plain(_) | Kind::DockerLogs { .. } => true,
+            Kind::DockerFile { comp, .. } => *comp == Comp::None,
+            _ => false,
+        }
+    }
+
+    /// The `docker logs` stream itself, as opposed to a file in a container.
+    pub fn is_docker_logs(&self) -> bool {
+        matches!(self.kind, Kind::DockerLogs { .. })
     }
 
     pub fn type_label(&self) -> &'static str {
@@ -123,7 +150,12 @@ impl Source {
             Kind::Gzip(_) => "gzip",
             Kind::ZipEntry { .. } => "zip",
             Kind::DockerLogs { .. } => "docker",
-            Kind::DockerFile { gz: true, .. } => "dk-gzip",
+            Kind::DockerFile {
+                comp: Comp::Gzip, ..
+            } => "dk-gzip",
+            Kind::DockerFile {
+                comp: Comp::Zip, ..
+            } => "dk-zip",
             Kind::DockerFile { .. } => "dk-file",
         }
     }
@@ -152,13 +184,13 @@ impl Source {
             Kind::DockerFile {
                 container,
                 path,
-                gz,
+                comp,
             } => {
                 let r = spawn_docker(&["exec", container, "cat", "--", path])?.0;
-                Ok(if *gz {
-                    Box::new(MultiGzDecoder::new(r))
-                } else {
-                    r
+                Ok(match comp {
+                    Comp::None => r,
+                    Comp::Gzip => Box::new(MultiGzDecoder::new(r)),
+                    Comp::Zip => unzip_stream(r)?,
                 })
             }
         }
@@ -175,11 +207,45 @@ impl Source {
             Kind::DockerFile {
                 container,
                 path,
-                gz: false,
+                comp: Comp::None,
             } => spawn_docker(&["exec", container, "tail", "-n", &n, "-F", "--", path]),
             _ => Err(io::Error::other("this source cannot be followed live")),
         }
     }
+}
+
+/// Decompresses every entry of a zip read as a plain stream (no seeking, so
+/// it works through `docker exec cat`). Entries are concatenated, each
+/// preceded by a `==> name <==` line like `tail` prints for several files.
+/// Runs on its own thread; dropping the returned reader stops it.
+fn unzip_stream(mut r: Box<dyn Read + Send>) -> io::Result<Box<dyn Read + Send>> {
+    let (reader, mut writer) = io::pipe()?;
+    std::thread::spawn(move || {
+        use std::io::Write;
+        loop {
+            match zip::read::read_zipfile_from_stream(&mut r) {
+                Ok(Some(mut entry)) => {
+                    if entry.is_dir() {
+                        continue;
+                    }
+                    let name = entry.name().map(|n| n.into_owned()).unwrap_or_default();
+                    if writeln!(writer, "==> {name} <==").is_err()
+                        || io::copy(&mut entry, &mut writer).is_err()
+                    {
+                        return;
+                    }
+                    // Make sure the next header starts on its own line.
+                    let _ = writeln!(writer);
+                }
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = writeln!(writer, "axtail: cannot read zip stream: {e}");
+                    return;
+                }
+            }
+        }
+    });
+    Ok(Box::new(reader))
 }
 
 pub struct Scan {
@@ -190,6 +256,43 @@ pub struct Scan {
 
 fn has_glob(s: &str) -> bool {
     s.contains(['*', '?'])
+}
+
+/// Compares names so that embedded numbers sort by value:
+/// `prod.2026-11-21.9.log` comes before `prod.2026-11-21.10.log`.
+pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (si, sj) = (i, j);
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let (x, y) = (&a[si..i], &b[sj..j]);
+            let strip = |d: &[u8]| -> usize { d.iter().take_while(|&&c| c == b'0').count() };
+            let (x, y) = (
+                &x[strip(x).min(x.len() - 1)..],
+                &y[strip(y).min(y.len() - 1)..],
+            );
+            let ord = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        } else {
+            let ord = a[i].to_ascii_lowercase().cmp(&b[j].to_ascii_lowercase());
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
 }
 
 /// Minimal wildcard match supporting `*` and `?`.
@@ -404,8 +507,79 @@ fn title_of(filters: &[String]) -> String {
     }
 }
 
-/// Docker mode: the container's log stream, plus any files inside the
-/// container matching the filters (listed with `docker exec <c> ls`).
+/// Where log files are usually kept inside a container. The container's
+/// working directory is searched too.
+const DOCKER_ROOTS: &[&str] = &[
+    "/var/log",
+    "/opt",
+    "/app",
+    "/srv",
+    "/data",
+    "/logs",
+    "/log",
+    "/var/www",
+    "/usr/src/app",
+    "/home",
+];
+
+/// How deep `find` descends below each searched directory.
+const DOCKER_MAX_DEPTH: u32 = 8;
+
+/// Default test for "is this a log file": *.log, rotated *.log.N(.gz),
+/// *.out, every file under /var/log except binary accounting files, and
+/// text or archives in any path that mentions "log".
+const DOCKER_LOG_TEST: &str = "\\( -name '*.log' -o -name '*.log.*' -o -name '*.out' \
+-o \\( -path '/var/log/*' ! -name 'wtmp*' ! -name 'btmp*' ! -name 'lastlog' ! -name '*.journal*' \\) \
+-o \\( -path '*log*' \\( -name '*.txt' -o -name '*.gz' -o -name '*.zip' \\) \\) \\) \
+! -name '*.tar.gz' ! -name '*.tgz' ! -name '*.pid' ! -name '*.lock' \
+! -name faillog ! -name '*.xz' ! -name '*.bz2' ! -name '*.zst'";
+
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Builds a POSIX sh script, run inside the container, that lists matching
+/// files as `size|mtime|path`. It only reads: `find` plus `stat`, with
+/// `head` bounding the output. Works with GNU and BusyBox tools; when
+/// `stat` or `find -exec {} +` is unavailable it falls back to bare paths.
+fn find_script(roots: &[String], with_workdir: bool, test: &str) -> String {
+    let mut dirs: Vec<String> = roots.iter().map(|r| sh_quote(r)).collect();
+    if with_workdir {
+        dirs.push("\"$PWD\"".into());
+    }
+    let prune = "\\( -name node_modules -o -name .git -o -name site-packages -o -name __pycache__ \
+-o -name .cache -o -name proc \\) -prune";
+    format!(
+        "set --; for d in {dirs}; do case \"$d\" in /) continue;; esac; [ -e \"$d\" ] && set -- \"$@\" \"$d\"; done; \
+[ $# -gt 0 ] || exit 0; \
+out=$(find \"$@\" -maxdepth {depth} -xdev {prune} -o -type f {test} -exec stat -c '%s|%Y|%n' {{}} + 2>/dev/null | head -n {limit}); \
+if [ -n \"$out\" ]; then printf '%s\\n' \"$out\"; \
+else find \"$@\" -maxdepth {depth} -xdev {prune} -o -type f {test} -print 2>/dev/null | head -n {limit}; fi",
+        dirs = dirs.join(" "),
+        depth = DOCKER_MAX_DEPTH,
+        limit = MAX_ENTRIES,
+    )
+}
+
+/// Parses one `size|mtime|path` line (or a bare path).
+fn parse_found(line: &str) -> Option<(Option<u64>, Option<SystemTime>, String)> {
+    let mut parts = line.splitn(3, '|');
+    if let (Some(a), Some(b), Some(path)) = (parts.next(), parts.next(), parts.next())
+        && let (Ok(size), Ok(secs)) = (a.parse::<u64>(), b.parse::<u64>())
+    {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        return Some((Some(size), Some(t), path.to_string()));
+    }
+    line.starts_with('/')
+        .then(|| (None, None, line.to_string()))
+}
+
+/// Docker mode: the container's log stream first, then log files found
+/// inside the container. Without filters the usual log directories are
+/// searched recursively; a filter narrows that down:
+///   `*.gz`, `prod.2026-11-21*`   name pattern, searched in the usual places
+///   `/opt/app/logs/*.gz`         name pattern under one directory
+///   `/opt/app/logs`              every file under a directory, or one file
 pub fn scan_docker(container: &str, filters: &[String]) -> Scan {
     let mut sources = vec![Source {
         kind: Kind::DockerLogs {
@@ -416,62 +590,84 @@ pub fn scan_docker(container: &str, filters: &[String]) -> Scan {
         modified: None,
     }];
     let mut warnings = Vec::new();
+    let defaults: Vec<String> = DOCKER_ROOTS.iter().map(|s| s.to_string()).collect();
+    let mut searches: Vec<(&str, Vec<String>, bool, String)> = Vec::new();
+    if filters.is_empty() {
+        searches.push(("", defaults.clone(), true, DOCKER_LOG_TEST.to_string()));
+    }
     for arg in filters {
-        let (dir, pattern) = if has_glob(arg) {
+        if has_glob(arg) {
             match arg.rsplit_once('/') {
-                Some((d, p)) => (if d.is_empty() { "/" } else { d }, Some(p)),
-                None => (".", Some(arg.as_str())),
+                Some((d, p)) => {
+                    let dir = if d.is_empty() { "/" } else { d };
+                    searches.push((
+                        arg,
+                        vec![dir.to_string()],
+                        false,
+                        format!("-name {}", sh_quote(p)),
+                    ));
+                }
+                None => searches.push((
+                    arg,
+                    defaults.clone(),
+                    true,
+                    format!("-name {}", sh_quote(arg)),
+                )),
             }
         } else {
-            (arg.as_str(), None)
-        };
+            searches.push((arg, vec![arg.clone()], false, String::new()));
+        }
+    }
+    let mut seen = HashSet::new();
+    'search: for (label, roots, workdir, test) in &searches {
+        let script = find_script(roots, *workdir, test);
         let out = Command::new(docker_bin())
-            .args(["exec", container, "ls", "-1Ap", "--", dir])
+            .args(["exec", container, "sh", "-c", &script])
             .stdin(Stdio::null())
             .output();
         let out = match out {
-            Ok(o) if o.status.success() => o,
-            Ok(o) => {
-                let msg = String::from_utf8_lossy(&o.stderr);
-                warnings.push(format!(
-                    "{arg}: {}",
-                    msg.trim().lines().last().unwrap_or("docker exec ls failed")
-                ));
-                continue;
-            }
+            Ok(o) => o,
             Err(e) => {
                 warnings.push(format!("cannot run docker: {e}"));
                 break;
             }
         };
-        let listing = String::from_utf8_lossy(&out.stdout);
-        for name in listing.lines() {
-            if name.is_empty() || name.ends_with('/') || sources.len() >= MAX_ENTRIES {
-                continue;
+        if !out.status.success() && out.stdout.is_empty() {
+            let msg = String::from_utf8_lossy(&out.stderr);
+            warnings.push(
+                msg.trim()
+                    .lines()
+                    .last()
+                    .unwrap_or("docker exec failed")
+                    .to_string(),
+            );
+            continue;
+        }
+        let before = sources.len();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if sources.len() > MAX_ENTRIES {
+                warnings.push(format!("list truncated to {MAX_ENTRIES} entries"));
+                break 'search;
             }
-            // `ls` on a single file prints the path itself.
-            let path = if name == dir {
-                name.to_string()
-            } else {
-                if pattern.is_some_and(|p| !wild_match(p, name)) {
-                    continue;
-                }
-                format!("{}/{name}", dir.trim_end_matches('/'))
+            let Some((size, modified, path)) = parse_found(line) else {
+                continue;
             };
-            let ext = lower_ext(&path);
-            if ext == "zip" {
+            if !seen.insert(path.clone()) {
                 continue;
             }
             sources.push(Source {
-                name: format!("{container}:{path}"),
+                name: path.clone(),
                 kind: Kind::DockerFile {
                     container: container.to_string(),
+                    comp: Comp::of(&path),
                     path,
-                    gz: ext == "gz" || ext == "gzip",
                 },
-                size: None,
-                modified: None,
+                size,
+                modified,
             });
+        }
+        if sources.len() == before && !label.is_empty() {
+            warnings.push(format!("{label}: no files found in the container"));
         }
     }
     let title = if filters.is_empty() {
@@ -489,6 +685,37 @@ pub fn scan_docker(container: &str, filters: &[String]) -> Scan {
 #[cfg(test)]
 mod tests {
     use super::wild_match;
+
+    #[test]
+    fn natural_order() {
+        use super::natural_cmp;
+        let mut v = vec![
+            "prod.2026-11-21.10.log",
+            "prod.2026-11-21.9.log",
+            "prod.2026-11-20.100.log",
+            "a.log",
+        ];
+        v.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            v,
+            [
+                "a.log",
+                "prod.2026-11-20.100.log",
+                "prod.2026-11-21.9.log",
+                "prod.2026-11-21.10.log"
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_find_output() {
+        use super::parse_found;
+        let (size, t, p) = parse_found("1234|1763800000|/opt/app/logs/a|b.log").unwrap();
+        assert_eq!((size, p.as_str()), (Some(1234), "/opt/app/logs/a|b.log"));
+        assert!(t.is_some());
+        assert_eq!(parse_found("/var/log/syslog").unwrap().2, "/var/log/syslog");
+        assert!(parse_found("find: warning").is_none());
+    }
 
     #[test]
     fn wildcards() {

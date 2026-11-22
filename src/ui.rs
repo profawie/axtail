@@ -256,9 +256,9 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
             };
             format!(" {text:>9}")
         };
-        let text = format!(
-            " {} {:<8} {:>10} {:>9}{}",
-            fit_left(&s.name, name_w),
+        let cell = fit_left(&s.name, name_w);
+        let rest = format!(
+            " {:<8} {:>10} {:>9}{}",
             s.type_label(),
             s.size.map_or("-".into(), human),
             age(s.modified),
@@ -274,10 +274,29 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::new()
         };
-        lines.push(Line::styled(
-            format!("{text:<w$}", w = inner.width as usize),
-            style,
-        ));
+        // Dim the folder part so file names in the same folder line up.
+        let split = if s.is_docker_logs() {
+            0
+        } else {
+            cell.trim_end().rfind(['/', '\\']).map_or(0, |i| i + 1)
+        };
+        let (dir, file) = cell.split_at(split);
+        let dir_style = if row == app.sel {
+            style
+        } else {
+            style.fg(Color::DarkGray)
+        };
+        let used = 1 + cell.chars().count() + rest.chars().count();
+        let pad = (inner.width as usize).saturating_sub(used);
+        lines.push(
+            Line::from(vec![
+                Span::styled(" ", style),
+                Span::styled(dir.to_string(), dir_style),
+                Span::styled(file.to_string(), style),
+                Span::styled(format!("{rest}{}", " ".repeat(pad)), style),
+            ])
+            .style(style),
+        );
     }
     if app.order.is_empty() {
         lines.push(Line::styled(
