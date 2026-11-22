@@ -1,0 +1,151 @@
+//! axtail - advanced tail: a fast, read-only terminal log viewer.
+
+mod app;
+mod search;
+mod source;
+mod ui;
+mod window;
+
+use std::process::ExitCode;
+
+use search::{Matcher, Mode};
+
+const USAGE: &str = "\
+axtail {v} - advanced tail for sysadmins (read-only log viewer)
+
+USAGE:
+    axtail [OPTIONS] <FILTER>...
+    axtail --docker <CONTAINER> [OPTIONS] [FILTER]...
+
+FILTER:
+    A log file, a directory, or a wildcard such as *.log, *.zip, *.txt,
+    api-*.log. Directories, .zip and .gz archives are scanned and every log
+    inside is listed. Quote wildcards to let axtail expand them itself.
+
+OPTIONS:
+    --docker <CONTAINER>   Read a container's logs through `docker logs`.
+                           With a FILTER, also list files inside the container.
+    --grep <PATTERN>       Advanced search: start with a regex already active
+                           and show the match count of every file in the list.
+    -i, --ignore-case      Make --grep case-insensitive.
+    --tail <LINES>         Lines kept in memory for docker/compressed logs
+                           (default 10000, max 200000).
+    -h, --help             Show this help.
+    -V, --version          Show the version.
+
+EXAMPLES:
+    axtail /var/log                      List every log in a directory
+    axtail '*.log'                       Logs in the current directory
+    axtail 'api-*.log' --grep 'ERROR|timeout'
+    axtail archive.zip                   Logs inside a zip, never extracted to disk
+    axtail app.log.gz                    Stream-decompressed gzip
+    axtail --docker myapp                Live container logs
+    axtail --docker myapp '/var/log/*.log'
+    axtail --docker myapp --grep 'panic'
+
+KEYS:
+    Up/Down/Left/Right  move      Enter  open log / toggle live
+    Ctrl+F  search (pauses live)  Ctrl+P / Ctrl+N  older / newer match
+    Ctrl+L  back to file list     Ctrl+G  about      Ctrl+X  exit
+";
+
+struct Args {
+    docker: Option<String>,
+    grep: Option<String>,
+    ignore_case: bool,
+    tail: usize,
+    filters: Vec<String>,
+}
+
+fn parse_args() -> Result<Option<Args>, String> {
+    let mut args = Args {
+        docker: None,
+        grep: None,
+        ignore_case: false,
+        tail: 10_000,
+        filters: Vec::new(),
+    };
+    let mut it = std::env::args().skip(1);
+    let mut any = false;
+    while let Some(a) = it.next() {
+        any = true;
+        let mut value = |name: &str| it.next().ok_or(format!("{name} needs a value"));
+        match a.as_str() {
+            "-h" | "--help" => return Ok(None),
+            "-V" | "--version" => {
+                println!("axtail {}", ui::VERSION);
+                std::process::exit(0);
+            }
+            "--docker" => args.docker = Some(value("--docker")?),
+            "--grep" => args.grep = Some(value("--grep")?),
+            "-i" | "--ignore-case" => args.ignore_case = true,
+            "--tail" => {
+                let n: usize = value("--tail")?
+                    .parse()
+                    .map_err(|_| "--tail needs a number".to_string())?;
+                args.tail = n.clamp(100, 200_000);
+            }
+            "--" => args.filters.extend(it.by_ref()),
+            s if s.starts_with("--") => return Err(format!("unknown option {s}")),
+            _ => args.filters.push(a),
+        }
+    }
+    if !any || (args.docker.is_none() && args.filters.is_empty()) {
+        return Ok(None);
+    }
+    Ok(Some(args))
+}
+
+fn main() -> ExitCode {
+    let args = match parse_args() {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            print!("{}", USAGE.replace("{v}", ui::VERSION));
+            return ExitCode::SUCCESS;
+        }
+        Err(e) => {
+            eprintln!("axtail: {e}\nTry 'axtail --help'.");
+            return ExitCode::from(2);
+        }
+    };
+    let grep = match &args.grep {
+        None => None,
+        Some(p) => match Matcher::new(
+            p,
+            if args.ignore_case {
+                Mode::RegexNoCase
+            } else {
+                Mode::Regex
+            },
+        ) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("axtail: invalid --grep pattern: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    let scan = match &args.docker {
+        Some(c) => source::scan_docker(c, &args.filters),
+        None => source::scan_local(&args.filters),
+    };
+    if scan.sources.is_empty() {
+        for w in &scan.warnings {
+            eprintln!("axtail: {w}");
+        }
+        eprintln!("axtail: no log files found");
+        return ExitCode::FAILURE;
+    }
+    let mut app = app::App::new(scan, grep, args.tail);
+    let mut terminal = ratatui::init();
+    let result = app.run(&mut terminal);
+    drop(app);
+    ratatui::restore();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("axtail: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
