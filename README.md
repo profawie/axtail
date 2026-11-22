@@ -129,6 +129,32 @@ dependencies are pure Rust. To force a toolchain:
 
 If rustup asks about Visual Studio during installation, choose to continue without it.
 
+## Install on a Linux server
+
+`install.sh` copies the binary into a directory on the `PATH`. The server does not need
+Rust: build once, then copy two files (`axtail` and `install.sh`) to each server.
+
+```sh
+# on the build machine
+./build.sh
+scp axtail install.sh user@server:/tmp/
+
+# on the server
+sudo /tmp/install.sh          # system-wide: /usr/local/bin/axtail
+/tmp/install.sh               # without root: ~/.local/bin/axtail
+```
+
+| Command | Result |
+| --- | --- |
+| `sudo ./install.sh` | Install to `/usr/local/bin` for all users |
+| `./install.sh` | Install to `~/.local/bin` for the current user (or `/usr/local/bin` when already root) |
+| `./install.sh --dir <DIR>` | Install into a specific directory |
+| `./install.sh --uninstall` | Remove axtail (use `sudo` or `--dir` the same way it was installed) |
+
+Run from a clone of this repository on a machine with Rust, `./install.sh` builds the
+binary first if it is missing. The script refuses to install a binary that does not run
+on the machine, for example one built for a different CPU architecture.
+
 Run the tests with `cargo test`.
 
 ## How it stays light on the server
