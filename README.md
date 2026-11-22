@@ -129,6 +129,57 @@ dependencies are pure Rust. To force a toolchain:
 
 If rustup asks about Visual Studio during installation, choose to continue without it.
 
+## Install on a Linux server
+
+One line, straight from GitHub. The server needs no Rust, only `curl` (or `wget`):
+
+```sh
+# system-wide for all users: /usr/local/bin/axtail
+curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sudo sh
+
+# current user only, no root: ~/.local/bin/axtail
+curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sh
+```
+
+This downloads the static binary for the server's CPU (x86_64 or aarch64) from the
+[latest release](https://github.com/profawie/axtail/releases/latest), verifies it against
+the release's `SHA256SUMS`, and installs it. Run the same command again to upgrade.
+Options go after `sh -s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sh -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sudo sh -s -- --uninstall
+```
+
+| Option | Result |
+| --- | --- |
+| `--dir <DIR>` | Install into a specific directory |
+| `--version <TAG>` | Install a specific release instead of the latest |
+| `--download` | Always download, even when an `axtail` file sits next to the script |
+| `--uninstall` | Remove axtail (use `sudo` or `--dir` the same way it was installed) |
+
+**Servers without internet access.** Copy two files and run the script there. It installs
+the `axtail` file next to it instead of downloading:
+
+```sh
+./build.sh                                # or download the binary from the releases page
+scp axtail install.sh user@server:/tmp/
+ssh user@server sudo /tmp/install.sh
+```
+
+Inside a clone on a machine with Rust, `./install.sh` builds the binary first if it is
+missing. The script refuses to install a binary that does not run on the machine.
+
+**Windows.** Download `axtail-windows-x86_64.exe` from the
+[releases page](https://github.com/profawie/axtail/releases/latest), or build with `.\build.ps1`.
+
+### Publishing a release
+
+Releases are built by GitHub Actions (`.github/workflows/release.yml`): static Linux
+binaries for x86_64 and aarch64, a Windows exe and `SHA256SUMS`. Bump `version` in
+`Cargo.toml`, then either push a tag (`git tag v0.2.0 && git push origin v0.2.0`) or run
+the **Release** workflow from the Actions tab, which tags the selected branch itself.
+
 Run the tests with `cargo test`.
 
 ## How it stays light on the server
