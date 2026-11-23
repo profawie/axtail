@@ -279,12 +279,7 @@ fn draw_list_bar(f: &mut Frame, area: Rect, app: &App) {
         ));
     }
     let right = vec![Span::styled(
-        format!(
-            "{} of {} ({}) ",
-            app.order.len(),
-            app.sources.len(),
-            clock::zone_label()
-        ),
+        format!("{} of {} files ", app.order.len(), app.sources.len()),
         DIM,
     )];
     two_sided(f, area, left, right);
@@ -506,6 +501,11 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
         }
     }
     let right = vec![
+        Span::styled("\u{25f7} ", Style::new().fg(Color::Gray)),
+        Span::styled(
+            format!("{} ", clock::zone_label()),
+            Style::new().fg(Color::LightCyan),
+        ),
         Span::styled(" ^G ", Style::new().fg(Color::Black).bg(Color::Gray)),
         Span::styled(" Help ", Style::new().fg(Color::Gray)),
         Span::styled(" ^X ", Style::new().fg(Color::Black).bg(Color::Gray)),
@@ -527,7 +527,7 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
             Span::raw(d.to_string()),
         ])
     };
-    let mut lines = vec![
+    let lines = vec![
         Line::styled(
             format!("axtail {VERSION}  \u{b7}  advanced tail for sysadmins"),
             Style::new()
@@ -540,7 +540,7 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
         ),
         Line::raw(""),
     ];
-    let viewer = [
+    let viewer = vec![
         Line::styled("Log viewer", head),
         row("type", "filter lines (applies as you type)"),
         row("  error timeout", "lines with error OR timeout"),
@@ -557,7 +557,7 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
         row("Ctrl+U / Ctrl+W", "clear filter / delete last word"),
         row("Ctrl+L", "back to the file list"),
     ];
-    let list = [
+    let list = vec![
         Line::styled("File list", head),
         row("type", "search names (all words must match)"),
         row("\u{2191} \u{2193} Enter", "select and open a log"),
@@ -566,28 +566,57 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
         row("Ctrl+S", "sort: newest, name, largest"),
         row("Esc", "clear search, then time range"),
     ];
-    if in_viewer {
-        lines.extend(viewer);
-        lines.push(Line::raw(""));
-        lines.extend(list);
+    let how = match clock::zone_source() {
+        "system" => "detected from this machine",
+        "--tz" => "set with --tz",
+        _ => "set with AXTAIL_TZ",
+    };
+    let zone = vec![
+        Line::styled("Time zone", head),
+        Line::from(vec![
+            Span::styled(format!("  {}", clock::zone_label()), key),
+            Span::styled(format!("  {how}"), DIM),
+        ]),
+        row("", "used for MODIFIED, From and To"),
+        row("--tz UTC", "start with another zone (UTC, local, +08:00)"),
+    ];
+    let general = vec![row("Ctrl+G / F1", "this help"), row("Ctrl+X", "exit")];
+    let (first, second): (&[Line], &[Line]) = if in_viewer {
+        (&viewer, &list)
     } else {
-        lines.extend(list);
-        lines.push(Line::raw(""));
-        lines.extend(viewer);
-    }
-    lines.push(Line::raw(""));
-    lines.push(row("Ctrl+G / F1", "this help"));
-    lines.push(row("Ctrl+X", "exit"));
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
+        (&list, &viewer)
+    };
+    let footer = Line::styled(
         format!(
             "{}  \u{b7}  press any key to close",
             env!("CARGO_PKG_REPOSITORY")
         ),
         DIM,
-    ));
-    let w = 70.min(area.width);
-    let h = (lines.len() as u16 + 2).min(area.height);
+    );
+    // Two columns when the terminal is wide enough, so it fits short screens.
+    let wide = area.width >= 140;
+    let mut left = lines.clone();
+    let mut right: Vec<Line> = Vec::new();
+    left.extend(first.iter().cloned());
+    left.push(Line::raw(""));
+    if wide {
+        right.extend(second.iter().cloned());
+        right.push(Line::raw(""));
+        right.extend(zone);
+        right.push(Line::raw(""));
+        right.extend(general);
+    } else {
+        left.extend(second.iter().cloned());
+        left.push(Line::raw(""));
+        left.extend(zone);
+        left.push(Line::raw(""));
+        left.extend(general);
+    }
+    left.push(Line::raw(""));
+    left.push(footer);
+    let col_w = 66u16;
+    let w = if wide { 2 * col_w + 4 } else { col_w + 4 }.min(area.width);
+    let h = (left.len().max(right.len()) as u16 + 2).min(area.height);
     let rect = Rect::new(
         area.x + (area.width - w) / 2,
         area.y + (area.height - h) / 2,
@@ -595,12 +624,17 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
         h,
     );
     f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .border_style(Style::new().fg(Color::LightCyan))
-                .title(" Help \u{b7} About "),
-        ),
-        rect,
-    );
+    let block = Block::bordered()
+        .border_style(Style::new().fg(Color::LightCyan))
+        .title(" Help \u{b7} About ");
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if wide {
+        let [l, r] =
+            Layout::horizontal([Constraint::Length(col_w + 1), Constraint::Min(0)]).areas(inner);
+        f.render_widget(Paragraph::new(left), l);
+        f.render_widget(Paragraph::new(right), r);
+    } else {
+        f.render_widget(Paragraph::new(left), inner);
+    }
 }
