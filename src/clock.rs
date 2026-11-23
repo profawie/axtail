@@ -164,6 +164,57 @@ pub fn format(secs: i64) -> String {
     }
 }
 
+/// Formats as local "YYYY-MM-DD HH:MM:SS".
+pub fn format_secs(secs: i64) -> String {
+    match OffsetDateTime::from_unix_timestamp(secs) {
+        Ok(t) => {
+            let t = t.to_offset(offset());
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                t.year(),
+                t.month() as u8,
+                t.day(),
+                t.hour(),
+                t.minute(),
+                t.second()
+            )
+        }
+        Err(_) => "-".into(),
+    }
+}
+
+/// Seconds east of UTC of the zone in use.
+pub fn offset_secs() -> i64 {
+    offset().whole_seconds() as i64
+}
+
+/// The local year of a timestamp.
+pub fn year(secs: i64) -> i32 {
+    OffsetDateTime::from_unix_timestamp(secs).map_or(1970, |t| t.to_offset(offset()).year())
+}
+
+/// Unix seconds of a calendar date and time written in a zone `off` seconds
+/// east of UTC. Fast path for parsing log timestamps; None when out of range.
+pub fn civil_to_unix(y: i64, m: i64, d: i64, h: i64, mi: i64, s: i64, off: i64) -> Option<i64> {
+    if !(1970..=9999).contains(&y)
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+        || !(0..24).contains(&h)
+        || !(0..60).contains(&mi)
+        || !(0..=60).contains(&s)
+    {
+        return None;
+    }
+    // Days since 1970-01-01 (proleptic Gregorian).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + s - off)
+}
+
 /// Parses a local "YYYY-MM-DD[ HH[:MM[:SS]]]" (also with 'T').
 /// For an upper bound (`end` = true) the result is the last second covered
 /// by the given precision, so "2026-11-22" as "To" means the whole day.
@@ -223,6 +274,25 @@ mod tests {
         for bad in ["8", "+15", "+8:60", "Asia/Kuala_Lumpur", "utc+x"] {
             assert!(parse_offset(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn civil_dates() {
+        assert_eq!(civil_to_unix(1970, 1, 1, 0, 0, 0, 0), Some(0));
+        assert_eq!(
+            civil_to_unix(2026, 11, 22, 13, 5, 9, 0),
+            Some(1_795_352_709)
+        );
+        assert_eq!(
+            civil_to_unix(2026, 11, 22, 13, 5, 9, 8 * 3600),
+            Some(1_795_352_709 - 8 * 3600)
+        );
+        assert_eq!(civil_to_unix(2024, 2, 29, 0, 0, 0, 0), Some(1_709_164_800));
+        assert_eq!(civil_to_unix(2026, 13, 1, 0, 0, 0, 0), None);
+        assert_eq!(
+            format_secs(parse("2026-11-22 13:05", false).unwrap() + 9),
+            "2026-11-22 13:05:09"
+        );
     }
 
     #[test]

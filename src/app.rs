@@ -17,6 +17,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use crate::clock;
 use crate::filter::{self, Filter};
 use crate::source::{Killer, Scan, Source, natural_cmp};
+use crate::summary::{self, Report};
 use crate::ui;
 use crate::window::{self, Appended, Line, LineReader, Target, Window};
 
@@ -38,6 +39,8 @@ impl Drop for Job {
 enum Msg {
     Window(u64, io::Result<Window>),
     Count(usize, io::Result<u64>),
+    /// A finished analysis; None when it was cancelled.
+    Summary(u64, Option<Box<Report>>),
 }
 
 /// Background reader for a live docker stream. Lines are filtered on that
@@ -116,6 +119,8 @@ pub struct Viewer {
     query_changed: Option<Instant>,
     pub query_error: Option<String>,
     pub notice: String,
+    /// Offset of the line the viewer was opened at from the summary.
+    pub mark: Option<u64>,
     last_poll: Instant,
 }
 
@@ -123,6 +128,53 @@ pub struct Viewer {
 pub enum Screen {
     List,
     Viewer,
+    Summary,
+}
+
+/// Summary tabs: one per level, then the per-file breakdown.
+pub const TABS: usize = 5;
+pub const FILES_TAB: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TypeSort {
+    Count,
+    Latest,
+    Oldest,
+}
+
+impl TypeSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            TypeSort::Count => "count",
+            TypeSort::Latest => "last seen",
+            TypeSort::Oldest => "first seen",
+        }
+    }
+}
+
+/// The message type opened with Enter, and the selected occurrence
+/// (0 = newest).
+pub struct Detail {
+    pub level: usize,
+    pub group: usize,
+    pub sel: usize,
+}
+
+pub struct Summary {
+    /// The running analysis.
+    pub job: Option<Job>,
+    pub done: Arc<AtomicU64>,
+    pub total: usize,
+    pub report: Option<Box<Report>>,
+    pub tab: usize,
+    pub sel: [usize; TABS],
+    pub sort: TypeSort,
+    pub query: String,
+    /// Visible rows of the current tab: indices into its types or files.
+    pub rows: Vec<usize>,
+    pub detail: Option<Detail>,
+    /// The files and time range the analysis covers.
+    scope: (Vec<usize>, Option<usize>, String, String),
 }
 
 /// Which field of the file list's top bar receives typing.
@@ -181,6 +233,9 @@ pub struct App {
     pub grep: Option<Arc<Filter>>,
     pub screen: Screen,
     pub viewer: Option<Viewer>,
+    pub summary: Option<Summary>,
+    /// The viewer was opened from the summary: Esc goes back there.
+    from_summary: bool,
     pub help: bool,
     /// Wrap long lines in the viewer (Ctrl+R toggles).
     pub wrap: bool,
@@ -261,6 +316,8 @@ impl App {
             grep,
             screen: Screen::List,
             viewer: None,
+            summary: None,
+            from_summary: false,
             help: false,
             wrap: true,
             cols: 78,
@@ -528,7 +585,8 @@ impl App {
                 .viewer
                 .as_ref()
                 .is_some_and(|v| v.query_changed.is_some());
-            let busy = self.viewer.as_ref().is_some_and(|v| v.loading.is_some());
+            let busy = self.viewer.as_ref().is_some_and(|v| v.loading.is_some())
+                || self.summary.as_ref().is_some_and(|s| s.job.is_some());
             let timeout = Duration::from_millis(if self.backlog {
                 0
             } else if busy || typing {
@@ -573,9 +631,256 @@ impl App {
             self.help = true;
             return;
         }
+        if (ctrl(&key, 'd') || key.code == KeyCode::F(2)) && self.screen != Screen::Summary {
+            self.viewer = None;
+            self.open_summary(false);
+            return;
+        }
         match self.screen {
             Screen::List => self.on_list_key(key),
             Screen::Viewer => self.on_viewer_key(key),
+            Screen::Summary => self.on_summary_key(key),
+        }
+    }
+
+    // ----- summary ---------------------------------------------------------
+
+    /// Shows the summary, analysing the listed files (search and time range
+    /// applied) unless that exact scope was analysed already.
+    fn open_summary(&mut self, force: bool) {
+        self.screen = Screen::Summary;
+        let mut files = self.order.clone();
+        files.sort_unstable();
+        let scope = (
+            files,
+            self.preset,
+            self.from_text.clone(),
+            self.to_text.clone(),
+        );
+        let old = self.summary.take();
+        if !force
+            && let Some(s) = old.as_ref()
+            && s.scope == scope
+            && (s.report.is_some() || s.job.is_some())
+        {
+            self.summary = old;
+            return;
+        }
+        // Oldest first, so the latest occurrences are the ones kept.
+        let mut srcs: Vec<(usize, Source)> = scope
+            .0
+            .iter()
+            .map(|&i| (i, self.sources[i].clone()))
+            .collect();
+        srcs.sort_by_key(|(_, s)| (s.is_docker_logs(), s.modified));
+        let range = self.range();
+        let job = self.new_job();
+        let done = Arc::new(AtomicU64::new(0));
+        let (id, cancel, progress, tx, counter) = (
+            job.id,
+            job.cancel.clone(),
+            job.progress.clone(),
+            self.tx.clone(),
+            done.clone(),
+        );
+        let total = srcs.len();
+        thread::spawn(move || {
+            let report = summary::analyse(srcs, range, &cancel, &progress, &counter);
+            let _ = tx.send(Msg::Summary(id, report.map(Box::new)));
+        });
+        self.summary = Some(Summary {
+            job: Some(job),
+            done,
+            total,
+            report: None,
+            tab: old.as_ref().map_or(0, |s| s.tab),
+            sel: [0; TABS],
+            sort: old.as_ref().map_or(TypeSort::Count, |s| s.sort),
+            query: old.map_or(String::new(), |s| s.query),
+            rows: Vec::new(),
+            detail: None,
+            scope,
+        });
+    }
+
+    /// Filters and sorts the rows of the current summary tab.
+    fn rebuild_summary_rows(&mut self) {
+        let Some(s) = &mut self.summary else { return };
+        s.rows.clear();
+        let Some(r) = &s.report else { return };
+        let terms: Vec<String> = s
+            .query
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
+            .collect();
+        let hit = |text: &str| {
+            let text = text.to_lowercase();
+            terms.iter().all(|t| text.contains(t.as_str()))
+        };
+        if s.tab == FILES_TAB {
+            let name = |i: usize| self.sources[r.files[i].src].name.as_str();
+            s.rows = (0..r.files.len()).filter(|&i| hit(name(i))).collect();
+            // Most errors first, then most warnings.
+            s.rows.sort_by(|&a, &b| {
+                let key = |i: usize| (r.files[i].counts[0], r.files[i].counts[1]);
+                key(b)
+                    .cmp(&key(a))
+                    .then_with(|| natural_cmp(name(a), name(b)))
+            });
+        } else {
+            let g = &r.groups[s.tab];
+            s.rows = (0..g.len()).filter(|&i| hit(&g[i].pattern)).collect();
+            match s.sort {
+                TypeSort::Count => s.rows.sort_by_key(|&i| std::cmp::Reverse(g[i].count)),
+                TypeSort::Latest => s.rows.sort_by_key(|&i| std::cmp::Reverse(g[i].last)),
+                TypeSort::Oldest => s.rows.sort_by_key(|&i| (g[i].first.is_none(), g[i].first)),
+            }
+        }
+        let last = s.rows.len().saturating_sub(1);
+        s.sel[s.tab] = s.sel[s.tab].min(last);
+    }
+
+    fn on_summary_key(&mut self, key: KeyEvent) {
+        if self.summary.as_ref().is_some_and(|s| s.detail.is_some()) {
+            return self.on_detail_key(key);
+        }
+        let page = self.rows.saturating_sub(8).max(1);
+        let Some(s) = &mut self.summary else { return };
+        if let Some(c) = typed(&key) {
+            if s.query.len() < 200 {
+                s.query.push(c);
+                s.sel[s.tab] = 0;
+            }
+            return self.rebuild_summary_rows();
+        }
+        let last = s.rows.len().saturating_sub(1);
+        let sel = &mut s.sel[s.tab];
+        match key.code {
+            KeyCode::Up => *sel = sel.saturating_sub(1),
+            KeyCode::Down => *sel = (*sel + 1).min(last),
+            KeyCode::PageUp => *sel = sel.saturating_sub(page),
+            KeyCode::PageDown => *sel = (*sel + page).min(last),
+            KeyCode::Home => *sel = 0,
+            KeyCode::End => *sel = last,
+            KeyCode::Tab | KeyCode::BackTab => {
+                let step = if key.code == KeyCode::Tab {
+                    1
+                } else {
+                    TABS - 1
+                };
+                s.tab = (s.tab + step) % TABS;
+                self.rebuild_summary_rows();
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let n = PRESETS.len();
+                let cur = self.preset.unwrap_or(0);
+                let next = if key.code == KeyCode::Right {
+                    (cur + 1) % n
+                } else {
+                    (cur + n - 1) % n
+                };
+                self.set_preset(next);
+                self.open_summary(false);
+            }
+            KeyCode::Enter => {
+                let Some(&row) = s.rows.get(*sel) else { return };
+                if s.tab == FILES_TAB {
+                    if let Some(src) = s.report.as_ref().map(|r| r.files[row].src) {
+                        self.from_summary = true;
+                        self.open_with(src, None);
+                    }
+                } else {
+                    s.detail = Some(Detail {
+                        level: s.tab,
+                        group: row,
+                        sel: 0,
+                    });
+                }
+            }
+            KeyCode::Char('s') if ctrl(&key, 's') => {
+                s.sort = match s.sort {
+                    TypeSort::Count => TypeSort::Latest,
+                    TypeSort::Latest => TypeSort::Oldest,
+                    TypeSort::Oldest => TypeSort::Count,
+                };
+                self.rebuild_summary_rows();
+            }
+            KeyCode::Char('r') if ctrl(&key, 'r') => self.open_summary(true),
+            KeyCode::Char('l') if ctrl(&key, 'l') => self.screen = Screen::List,
+            KeyCode::Backspace => {
+                s.query.pop();
+                self.rebuild_summary_rows();
+            }
+            KeyCode::Char('u') if ctrl(&key, 'u') => {
+                s.query.clear();
+                self.rebuild_summary_rows();
+            }
+            KeyCode::Char('w') if ctrl(&key, 'w') => {
+                delete_word(&mut s.query);
+                self.rebuild_summary_rows();
+            }
+            KeyCode::Esc => {
+                if s.job.is_some() {
+                    // Cancel; with nothing to show yet, leave the screen.
+                    s.job = None;
+                    self.screen = Screen::List;
+                } else if !s.query.is_empty() {
+                    s.query.clear();
+                    self.rebuild_summary_rows();
+                } else {
+                    self.screen = Screen::List;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_detail_key(&mut self, key: KeyEvent) {
+        let page = self.rows.saturating_sub(12).max(1);
+        let Some(s) = &mut self.summary else { return };
+        let (Some(d), Some(r)) = (&mut s.detail, &s.report) else {
+            return;
+        };
+        let occ = &r.groups[d.level][d.group].occ;
+        let last = occ.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up => d.sel = d.sel.saturating_sub(1),
+            KeyCode::Down => d.sel = (d.sel + 1).min(last),
+            KeyCode::PageUp => d.sel = d.sel.saturating_sub(page),
+            KeyCode::PageDown => d.sel = (d.sel + page).min(last),
+            KeyCode::Home => d.sel = 0,
+            KeyCode::End => d.sel = last,
+            KeyCode::Left | KeyCode::Right => {
+                // The previous / next type of the list.
+                let at = s.rows.iter().position(|&g| g == d.group).unwrap_or(0);
+                let to = if key.code == KeyCode::Right {
+                    (at + 1).min(s.rows.len().saturating_sub(1))
+                } else {
+                    at.saturating_sub(1)
+                };
+                if let Some(&g) = s.rows.get(to) {
+                    s.sel[s.tab] = to;
+                    *d = Detail {
+                        level: d.level,
+                        group: g,
+                        sel: 0,
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                // Newest first on screen, oldest first in the ring.
+                if let Some(o) = occ.get(last.saturating_sub(d.sel)) {
+                    let (src, jump) = (o.src, (o.off, o.line));
+                    self.from_summary = true;
+                    self.open_with(src, Some(jump));
+                }
+            }
+            KeyCode::Char('l') if ctrl(&key, 'l') => {
+                s.detail = None;
+                self.screen = Screen::List;
+            }
+            KeyCode::Esc | KeyCode::Backspace => s.detail = None,
+            _ => {}
         }
     }
 
@@ -606,7 +911,7 @@ impl App {
             KeyCode::Char('f') if ctrl(&key, 'f') => {
                 v.notice = "Just type: the filter is at the top. Example: error timeout".into();
             }
-            KeyCode::Char('l') if ctrl(&key, 'l') => self.back_to_list(),
+            KeyCode::Char('l') if ctrl(&key, 'l') => self.leave_viewer(true),
             KeyCode::Up => self.scroll(-1),
             KeyCode::Down => self.scroll(1),
             KeyCode::PageUp => self.scroll(-page),
@@ -653,16 +958,22 @@ impl App {
                     v.query.clear();
                     v.query_changed = Some(Instant::now() - TYPE_DELAY);
                 } else {
-                    self.back_to_list();
+                    self.leave_viewer(false);
                 }
             }
             _ => {}
         }
     }
 
-    fn back_to_list(&mut self) {
+    /// Closes the viewer: back to the summary it was opened from, or to the
+    /// file list.
+    fn leave_viewer(&mut self, to_list: bool) {
         self.viewer = None; // drops follower and cancels jobs
-        self.screen = Screen::List;
+        self.screen = if !to_list && self.from_summary && self.summary.is_some() {
+            Screen::Summary
+        } else {
+            Screen::List
+        };
     }
 
     /// Applies the typed filter once typing has paused.
@@ -721,9 +1032,16 @@ impl App {
     // ----- viewer ----------------------------------------------------------
 
     fn open(&mut self, idx: usize) {
+        self.from_summary = false;
+        self.open_with(idx, None);
+    }
+
+    /// Opens a log; `jump` = (offset, line number) of a line to show, paused.
+    fn open_with(&mut self, idx: usize, jump: Option<(u64, u64)>) {
         let src = self.sources[idx].clone();
         let can_live = src.can_live();
-        let filter = self.grep.clone();
+        // A jump must show its line, so no filter may hide it.
+        let filter = self.grep.clone().filter(|_| jump.is_none());
         let query = filter.as_ref().map_or(String::new(), |f| f.text.clone());
         self.viewer = Some(Viewer {
             src,
@@ -739,11 +1057,16 @@ impl App {
             query,
             query_changed: None,
             query_error: None,
-            notice: String::new(),
+            notice: jump.map_or(String::new(), |(_, line)| {
+                format!("Line {line}, highlighted  \u{b7}  Esc goes back to the summary")
+            }),
+            mark: jump.map(|j| j.0),
             last_poll: Instant::now(),
         });
         self.screen = Screen::Viewer;
-        if can_live {
+        if let Some((off, _)) = jump {
+            self.start_load(Target::Around(off), After::Anchor { off, delta: -2 });
+        } else if can_live {
             self.set_live(true);
         } else {
             self.start_load(Target::End, After::Bottom);
@@ -927,6 +1250,15 @@ impl App {
                     if self.sort == Sort::Matches && self.screen == Screen::List {
                         self.rebuild_order();
                     }
+                }
+                Msg::Summary(id, report) => {
+                    let Some(s) = &mut self.summary else { continue };
+                    if s.job.as_ref().map(|j| j.id) != Some(id) {
+                        continue;
+                    }
+                    s.job = None;
+                    s.report = report;
+                    self.rebuild_summary_rows();
                 }
                 Msg::Window(id, res) => {
                     let Some(v) = &mut self.viewer else { continue };

@@ -4,6 +4,7 @@ mod app;
 mod clock;
 mod filter;
 mod source;
+mod summary;
 mod ui;
 mod window;
 
@@ -58,6 +59,9 @@ KEYS:
                 Up/Down + Enter to open
     Log viewer  type to filter lines (error timeout, +must, -skip, \"phrase\",
                 /regex/), Up/Down scroll, Enter live/pause, Esc back
+    Summary     Ctrl+D analyses the listed logs: lines per level and errors
+                grouped into types; Tab next level, Enter details with every
+                timestamp, Enter again opens the log at that line
     Anywhere    Ctrl+G help, Ctrl+X exit
 
 TIME ZONE:

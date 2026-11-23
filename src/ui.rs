@@ -8,10 +8,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
-use crate::app::{App, Count, Focus, PRESETS, Screen, Viewer};
+use crate::app::{App, Count, FILES_TAB, Focus, PRESETS, Screen, Summary, Viewer};
 use crate::clock;
+use crate::summary::{Group, LEVEL_NAMES, Report};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -61,7 +62,7 @@ fn fit_left(s: &str, width: usize) -> String {
 
 /// Makes raw log bytes safe to print: lossy UTF-8, no ANSI escapes, no
 /// control characters, tabs expanded.
-fn sanitize(data: &[u8]) -> String {
+pub fn sanitize(data: &[u8]) -> String {
     let text = String::from_utf8_lossy(data);
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -213,7 +214,15 @@ pub fn draw(f: &mut Frame, app: &App) {
     .areas(f.area());
 
     let viewer = app.viewer.as_ref().filter(|_| app.screen == Screen::Viewer);
-    let subject = viewer.map_or(app.title.as_str(), |v| v.src.name.as_str());
+    let summary = app
+        .summary
+        .as_ref()
+        .filter(|_| app.screen == Screen::Summary);
+    let subject = match (viewer, summary) {
+        (Some(v), _) => v.src.name.clone(),
+        (_, Some(_)) => format!("Summary of {}", app.title),
+        _ => app.title.clone(),
+    };
     f.render_widget(
         Paragraph::new(format!(" axtail {VERSION} - {subject}")).style(
             Style::new()
@@ -223,20 +232,580 @@ pub fn draw(f: &mut Frame, app: &App) {
         ),
         header,
     );
-    match viewer {
-        Some(v) => {
+    match (viewer, summary) {
+        (Some(v), _) => {
             draw_viewer_bar(f, bar, v);
             draw_viewer(f, body, v, app.wrap);
         }
-        None => {
+        (_, Some(s)) => {
+            draw_summary_bar(f, bar, app, s);
+            match (&s.report, &s.detail) {
+                (Some(r), Some(d)) => {
+                    draw_detail(f, body, app, &r.groups[d.level][d.group], d.level, d.sel)
+                }
+                (Some(r), None) => draw_summary(f, body, app, s, r),
+                (None, _) => draw_analysing(f, body, s),
+            }
+        }
+        _ => {
             draw_list_bar(f, bar, app);
             draw_list(f, body, app);
         }
     }
-    draw_status(f, status, app, viewer);
+    draw_status(f, status, app, viewer, summary);
     if app.help {
-        draw_help(f, f.area(), viewer.is_some());
+        draw_help(f, f.area(), app.screen);
     }
+}
+
+// ----- summary ---------------------------------------------------------------
+
+/// One colour per summary tab: ERROR, WARN, INFO, DEBUG, FILES.
+const TAB_COLORS: [Color; 5] = [
+    Color::LightRed,
+    Color::Yellow,
+    Color::LightGreen,
+    Color::LightBlue,
+    Color::LightMagenta,
+];
+const PLACEHOLDER: Style = Style::new().fg(Color::LightMagenta);
+const SELECTED: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Cyan)
+    .add_modifier(Modifier::BOLD);
+const TABLE_HEAD: Style = Style::new()
+    .fg(Color::Cyan)
+    .add_modifier(Modifier::BOLD.union(Modifier::UNDERLINED));
+
+/// 1234567 -> "1,234,567".
+fn commas(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn stamp(t: Option<i64>) -> String {
+    t.map_or("-".into(), clock::format_secs)
+}
+
+/// "3d 4h", "2h 5m", "40s": how long a type has been occurring.
+fn span_text(secs: i64) -> String {
+    match secs {
+        ..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        3600..86400 => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+        _ => format!("{}d {}h", secs / 86400, secs % 86400 / 3600),
+    }
+}
+
+fn percent(part: u64, whole: u64) -> String {
+    if whole == 0 || part == 0 {
+        return "0%".into();
+    }
+    let p = part as f64 * 100.0 / whole as f64;
+    if p < 0.1 {
+        "<0.1%".into()
+    } else if p < 10.0 {
+        format!("{p:.1}%")
+    } else {
+        format!("{p:.0}%")
+    }
+}
+
+/// A message type with its placeholders (<n>, <ip>, ...) in their own colour.
+fn pattern_spans(text: &str, base: Style, mark: Style) -> Vec<Span<'static>> {
+    const MARKS: [&str; 6] = ["<n>", "<ip>", "<uuid>", "<hex>", "<id>", "<*>"];
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next = MARKS
+            .iter()
+            .filter_map(|m| rest.find(m).map(|at| (at, m.len())))
+            .min();
+        match next {
+            Some((at, len)) => {
+                if at > 0 {
+                    spans.push(Span::styled(rest[..at].to_string(), base));
+                }
+                spans.push(Span::styled(rest[at..at + len].to_string(), mark));
+                rest = &rest[at + len..];
+            }
+            None => {
+                spans.push(Span::styled(rest.to_string(), base));
+                break;
+            }
+        }
+    }
+    spans
+}
+
+/// First visible row so that the selection stays on screen.
+fn scroll_top(sel: usize, rows: usize) -> usize {
+    (sel + 1).saturating_sub(rows)
+}
+
+fn draw_summary_bar(f: &mut Frame, area: Rect, app: &App, s: &Summary) {
+    let preset = match app.preset {
+        Some(i) => PRESETS[i].0,
+        None => "Custom",
+    };
+    let time = [
+        Span::styled("   Time ", LABEL),
+        Span::styled(
+            format!("\u{25c2} {preset} \u{25b8}"),
+            Style::new().fg(Color::LightYellow),
+        ),
+    ];
+    let mut left;
+    let mut right = Vec::new();
+    if let (Some(d), Some(r)) = (&s.detail, &s.report) {
+        let color = TAB_COLORS[d.level];
+        let at = s
+            .rows
+            .iter()
+            .position(|&g| g == d.group)
+            .map_or(0, |p| p + 1);
+        left = vec![
+            Span::styled(" Summary \u{25b8} ", LABEL),
+            Span::styled(
+                LEVEL_NAMES[d.level],
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" \u{25b8} ", LABEL),
+            Span::raw(format!("type {at} of {}", s.rows.len())),
+        ];
+        left.extend(time);
+        right.push(Span::styled(
+            format!("{} occurrences ", commas(r.groups[d.level][d.group].count)),
+            Style::new().fg(color),
+        ));
+    } else {
+        left = vec![
+            Span::styled(" Find \u{25b8} ", LABEL),
+            Span::raw(s.query.clone()),
+            Span::raw(CURSOR),
+        ];
+        if s.query.is_empty() {
+            left.push(Span::styled(" type to search", DIM));
+        }
+        left.extend(time);
+        if let Some(r) = &s.report {
+            right.push(Span::styled(
+                format!("{} read in {:.2}s ", human(r.bytes), r.secs),
+                DIM,
+            ));
+        }
+    }
+    two_sided(f, area, left, right);
+}
+
+fn draw_analysing(f: &mut Frame, area: Rect, s: &Summary) {
+    let block = frame_block(" Summary ".into(), String::new());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let lines = match &s.job {
+        Some(job) => vec![
+            Line::raw(""),
+            Line::from(vec![
+                Span::raw("  "),
+                badge("ANALYSING", Color::LightMagenta),
+                Span::styled(
+                    format!(
+                        "  {} of {} files",
+                        s.done.load(Ordering::Relaxed).min(s.total as u64),
+                        s.total
+                    ),
+                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  \u{b7}  {} read",
+                        human(job.progress.load(Ordering::Relaxed))
+                    ),
+                    Style::new().fg(Color::LightCyan),
+                ),
+            ]),
+            Line::raw(""),
+            Line::styled(
+                "  Counting lines per level and grouping messages into types...",
+                DIM,
+            ),
+            Line::styled("  Esc cancels.", DIM),
+        ],
+        None => vec![
+            Line::raw(""),
+            Line::styled("  The analysis was cancelled. Ctrl+R runs it again.", DIM),
+        ],
+    };
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The five tiles at the top: one per level plus the files.
+fn draw_tiles(f: &mut Frame, area: Rect, s: &Summary, r: &Report) {
+    let tiles: [Rect; 5] = Layout::horizontal([Constraint::Ratio(1, 5); 5]).areas(area);
+    let entries: u64 = r.totals.iter().sum();
+    for (i, rect) in tiles.into_iter().enumerate() {
+        let color = TAB_COLORS[i];
+        let on = s.tab == i;
+        let name = if i == FILES_TAB {
+            "FILES"
+        } else {
+            LEVEL_NAMES[i]
+        };
+        let title = if on {
+            badge(name, color)
+        } else {
+            Span::styled(
+                format!(" {name} "),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            )
+        };
+        let block = Block::bordered()
+            .border_type(if on {
+                BorderType::Double
+            } else {
+                BorderType::Plain
+            })
+            .border_style(if on {
+                Style::new().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(color)
+            })
+            .title(title);
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let big = Style::new().fg(color).add_modifier(Modifier::BOLD);
+        let wide = inner.width >= 26;
+        let lines = if i == FILES_TAB {
+            let failed = r.files.iter().filter(|x| x.error.is_some()).count();
+            vec![
+                Line::styled(format!(" {}", commas(r.files.len() as u64)), big),
+                Line::raw(format!(" {} lines", commas(r.lines))),
+                if failed > 0 {
+                    Line::styled(
+                        format!(" {failed} unreadable"),
+                        Style::new().fg(Color::LightRed),
+                    )
+                } else {
+                    Line::styled(format!(" {} no level", commas(r.totals[4])), DIM)
+                },
+            ]
+        } else {
+            let types = r.groups[i].len();
+            let kinds = format!(
+                "{}{} type{}",
+                types,
+                if r.capped[i] { "+" } else { "" },
+                if types == 1 { "" } else { "s" }
+            );
+            let share = percent(r.totals[i], entries);
+            let big = Line::styled(format!(" {}", commas(r.totals[i])), big);
+            if wide {
+                let last = r.level_last[i]
+                    .map_or(" -".into(), |t| format!(" last {}", clock::format_secs(t)));
+                vec![
+                    big,
+                    Line::raw(format!(" {share}  \u{b7}  {kinds}")),
+                    Line::styled(last, DIM),
+                ]
+            } else {
+                vec![
+                    big,
+                    Line::raw(format!(" {share} of lines")),
+                    Line::styled(format!(" {kinds}"), DIM),
+                ]
+            }
+        };
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn draw_summary(f: &mut Frame, area: Rect, app: &App, s: &Summary, r: &Report) {
+    let tiles_h = if area.height >= 11 { 5 } else { 0 };
+    let [tiles, table] =
+        Layout::vertical([Constraint::Length(tiles_h), Constraint::Min(3)]).areas(area);
+    if tiles_h > 0 {
+        draw_tiles(f, tiles, s, r);
+    }
+    let color = TAB_COLORS[s.tab];
+    let files = s.tab == FILES_TAB;
+    let title = if files {
+        format!(" FILES \u{b7} {} analysed ", s.rows.len())
+    } else {
+        format!(
+            " {} \u{b7} {} message type{} ",
+            LEVEL_NAMES[s.tab],
+            s.rows.len(),
+            if s.rows.len() == 1 { "" } else { "s" }
+        )
+    };
+    let block = Block::bordered()
+        .border_style(Style::new().fg(color))
+        .title(Span::styled(
+            title,
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ))
+        .title(
+            Line::from(Span::styled(
+                if files {
+                    " most errors first ".to_string()
+                } else {
+                    format!(" sort: {} ", s.sort.label())
+                },
+                Style::new().fg(Color::Gray),
+            ))
+            .right_aligned(),
+        );
+    let inner = block.inner(table);
+    f.render_widget(block, table);
+    if inner.height < 2 {
+        return;
+    }
+    let width = inner.width as usize;
+    let rows = inner.height as usize - 1;
+    let sel = s.sel[s.tab];
+    let top = scroll_top(sel, rows);
+    let mut lines = Vec::with_capacity(rows + 1);
+    if files {
+        let name_w = width.saturating_sub(1 + 6 * 12).clamp(12, 60);
+        lines.push(Line::styled(
+            format!(
+                " {:<name_w$} {:>11} {:>11} {:>11} {:>11} {:>11} {:>11}",
+                "NAME", "LINES", "ERROR", "WARN", "INFO", "DEBUG", "NO LEVEL"
+            ),
+            TABLE_HEAD,
+        ));
+        for (row, &i) in s.rows.iter().enumerate().skip(top).take(rows) {
+            let st = &r.files[i];
+            let on = row == sel;
+            let pick = |style: Style| if on { SELECTED } else { style };
+            let mut spans = vec![Span::styled(
+                format!(" {}", fit_left(&app.sources[st.src].name, name_w)),
+                pick(Style::new()),
+            )];
+            if let Some(e) = &st.error {
+                spans.push(Span::styled(
+                    format!("  cannot read: {e}"),
+                    pick(Style::new().fg(Color::LightRed)),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!(" {:>11}", commas(st.lines)),
+                    pick(Style::new().fg(Color::White)),
+                ));
+                for (lv, &n) in st.counts.iter().enumerate() {
+                    let style = match (n, lv) {
+                        (0, _) => DIM,
+                        (_, 4) => Style::new().fg(Color::Gray),
+                        _ => Style::new().fg(TAB_COLORS[lv]),
+                    };
+                    spans.push(Span::styled(format!(" {:>11}", commas(n)), pick(style)));
+                }
+            }
+            let line = Line::from(spans);
+            lines.push(if on { pad_selected(line, width) } else { line });
+        }
+    } else {
+        let groups = &r.groups[s.tab];
+        let (show_first, show_files) = (width >= 100, width >= 76);
+        let mut head = format!(" {:>10}  {:<19}", "COUNT", "LAST SEEN");
+        if show_first {
+            head.push_str(&format!("  {:<19}", "FIRST SEEN"));
+        }
+        if show_files {
+            head.push_str(&format!("  {:>5}", "FILES"));
+        }
+        head.push_str("  MESSAGE TYPE");
+        lines.push(Line::styled(head, TABLE_HEAD));
+        for (row, &i) in s.rows.iter().enumerate().skip(top).take(rows) {
+            let g = &groups[i];
+            let on = row == sel;
+            let pick = |style: Style| if on { SELECTED } else { style };
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {:>10}", commas(g.count)),
+                    pick(Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                ),
+                Span::styled(
+                    format!("  {:<19}", stamp(g.last)),
+                    pick(Style::new().fg(Color::White)),
+                ),
+            ];
+            if show_first {
+                spans.push(Span::styled(format!("  {:<19}", stamp(g.first)), pick(DIM)));
+            }
+            if show_files {
+                spans.push(Span::styled(
+                    format!("  {:>5}", g.files),
+                    pick(Style::new().fg(Color::LightCyan)),
+                ));
+            }
+            spans.push(Span::styled("  ", pick(Style::new())));
+            spans.extend(pattern_spans(
+                &g.pattern,
+                pick(Style::new()),
+                pick(PLACEHOLDER),
+            ));
+            let line = Line::from(spans);
+            lines.push(if on { pad_selected(line, width) } else { line });
+        }
+    }
+    if s.rows.is_empty() {
+        let (text, style) = if !s.query.is_empty() {
+            (
+                " Nothing matches the search. Esc clears it.".to_string(),
+                DIM,
+            )
+        } else if s.tab == 0 {
+            (
+                " No ERROR lines found. \u{2714}".to_string(),
+                Style::new().fg(Color::LightGreen),
+            )
+        } else if files {
+            (" No files to analyse.".to_string(), DIM)
+        } else {
+            (format!(" No {} lines found.", LEVEL_NAMES[s.tab]), DIM)
+        };
+        lines.push(Line::styled(text, style));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Extends the highlight of a selected row to the full width.
+fn pad_selected(mut line: Line<'static>, width: usize) -> Line<'static> {
+    let used: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    line.spans.push(Span::styled(
+        " ".repeat(width.saturating_sub(used)),
+        SELECTED,
+    ));
+    line
+}
+
+/// One message type: what it is, when it happened and every kept occurrence.
+fn draw_detail(f: &mut Frame, area: Rect, app: &App, g: &Group, level: usize, sel: usize) {
+    let color = TAB_COLORS[level];
+    let key = |k: &str| Span::styled(format!("  {k:<10}"), LABEL);
+    // Newest first on screen.
+    let shown = g.occ.len();
+    let picked = shown.checked_sub(1 + sel).and_then(|i| g.occ.get(i));
+    let mut info = vec![
+        Line::from(
+            [key("Type")]
+                .into_iter()
+                .chain(pattern_spans(
+                    &g.pattern,
+                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                    PLACEHOLDER,
+                ))
+                .collect::<Vec<_>>(),
+        ),
+        Line::from(vec![
+            key("Count"),
+            Span::styled(
+                commas(g.count),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                " in {} file{}",
+                g.files,
+                if g.files == 1 { "" } else { "s" }
+            )),
+        ]),
+        Line::from(vec![
+            key("First"),
+            Span::raw(stamp(g.first)),
+            Span::styled("    Last  ", LABEL),
+            Span::raw(stamp(g.last)),
+            Span::styled("    Span  ", LABEL),
+            Span::raw(match (g.first, g.last) {
+                (Some(a), Some(b)) => span_text(b - a),
+                _ => "-".into(),
+            }),
+        ]),
+    ];
+    if let Some(o) = picked {
+        info.push(Line::from(vec![
+            key("Message"),
+            Span::styled(o.text.to_string(), Style::new().fg(color)),
+        ]));
+    }
+    if !g.trace.is_empty() {
+        info.push(Line::styled("  Stack trace of the first occurrence", LABEL));
+        info.extend(g.trace.iter().map(|t| {
+            Line::styled(
+                format!("    {}", t.trim_start()),
+                Style::new().fg(Color::Gray),
+            )
+        }));
+    }
+    let inner_w = area.width.saturating_sub(2).max(20) as usize;
+    let need: usize = info
+        .iter()
+        .map(|l| l.width().div_ceil(inner_w).max(1))
+        .sum();
+    let top_h = (need as u16 + 2).min(area.height.saturating_sub(6)).max(3);
+    let [top, bottom] =
+        Layout::vertical([Constraint::Length(top_h), Constraint::Min(3)]).areas(area);
+    let block = Block::bordered()
+        .border_type(BorderType::Double)
+        .border_style(Style::new().fg(color))
+        .title(badge(&format!("{} type", LEVEL_NAMES[level]), color));
+    let inner = block.inner(top);
+    f.render_widget(block, top);
+    f.render_widget(Paragraph::new(info).wrap(Wrap { trim: false }), inner);
+
+    let kept = if (shown as u64) < g.count {
+        format!(" latest {} of {} ", commas(shown as u64), commas(g.count))
+    } else {
+        String::new()
+    };
+    let block = frame_block(format!(" Occurrences ({}) ", commas(shown as u64)), kept);
+    let inner = block.inner(bottom);
+    f.render_widget(block, bottom);
+    if inner.height < 2 {
+        return;
+    }
+    let width = inner.width as usize;
+    let name_w = (width / 4).clamp(12, 36);
+    let rows = inner.height as usize - 1;
+    let mut lines = vec![Line::styled(
+        format!(
+            " {:<19}  {:<name_w$}  {:>9}  MESSAGE",
+            "TIMESTAMP", "FILE", "LINE"
+        ),
+        TABLE_HEAD,
+    )];
+    for (row, o) in g
+        .occ
+        .iter()
+        .rev()
+        .enumerate()
+        .skip(scroll_top(sel, rows))
+        .take(rows)
+    {
+        let on = row == sel;
+        let pick = |style: Style| if on { SELECTED } else { style };
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {:<19}", stamp(o.ts)),
+                pick(Style::new().fg(Color::White)),
+            ),
+            Span::styled(
+                format!("  {}", fit_left(&app.sources[o.src].name, name_w)),
+                pick(Style::new().fg(Color::LightCyan)),
+            ),
+            Span::styled(format!("  {:>9}", commas(o.line)), pick(DIM)),
+            Span::styled(format!("  {}", o.text), pick(Style::new().fg(color))),
+        ]);
+        lines.push(if on { pad_selected(line, width) } else { line });
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Renders `left` and right-aligns `right` on the same row.
@@ -469,12 +1038,21 @@ fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer, wrap: bool) {
     let width = inner.width as usize;
     let highlight = v.filter.as_ref().and_then(|f| f.highlight.as_ref());
     let height = inner.height as usize;
+    // The line the summary jumped to stands out.
+    let marked = |off: u64, mut line: Line<'static>| {
+        if v.mark == Some(off) {
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::REVERSED);
+            }
+        }
+        line
+    };
     let mut lines: Vec<Line> = if !wrap {
         w.lines
             .iter()
             .skip(v.top)
             .take(height)
-            .map(|l| render_line(&l.data, v.hscroll, width, highlight))
+            .map(|l| marked(l.off, render_line(&l.data, v.hscroll, width, highlight)))
             .collect()
     } else if v.pinned {
         // At the end: fill from the bottom so the newest line is always whole.
@@ -483,9 +1061,8 @@ fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer, wrap: bool) {
             if rows.len() >= height {
                 break;
             }
-            let mut part = wrap_line(&l.data, width, highlight);
-            part.reverse();
-            rows.extend(part);
+            let part = wrap_line(&l.data, width, highlight);
+            rows.extend(part.into_iter().rev().map(|p| marked(l.off, p)));
         }
         rows.truncate(height);
         rows.reverse();
@@ -496,7 +1073,8 @@ fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer, wrap: bool) {
             if rows.len() >= height {
                 break;
             }
-            rows.extend(wrap_line(&l.data, width, highlight));
+            let part = wrap_line(&l.data, width, highlight);
+            rows.extend(part.into_iter().map(|p| marked(l.off, p)));
         }
         rows.truncate(height);
         rows
@@ -516,11 +1094,38 @@ fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer, wrap: bool) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_status(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
+fn draw_status(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    viewer: Option<&Viewer>,
+    summary: Option<&Summary>,
+) {
     let mut left = Vec::new();
     let tip = |t: &str| Span::styled(format!(" {t}"), Style::new().fg(Color::Gray));
-    match viewer {
-        Some(v) => {
+    match (viewer, summary) {
+        (None, Some(s)) => {
+            if let Some(job) = &s.job {
+                left.push(badge("ANALYSING", Color::LightMagenta));
+                left.push(tip(&format!(
+                    "{} of {} files  \u{b7}  {} read  \u{b7}  Esc cancels",
+                    s.done.load(Ordering::Relaxed).min(s.total as u64),
+                    s.total,
+                    human(job.progress.load(Ordering::Relaxed))
+                )));
+            } else if let Some(d) = &s.detail {
+                left.push(badge("DETAILS", TAB_COLORS[d.level]));
+                left.push(tip("\u{2191}\u{2193} select  \u{b7}  Enter open the log at that line  \u{b7}  \u{2190}\u{2192} other types  \u{b7}  Esc back"));
+            } else {
+                left.push(badge("SUMMARY", Color::LightMagenta));
+                left.push(tip(if s.tab == FILES_TAB {
+                    "Tab next view  \u{b7}  \u{2191}\u{2193} select  \u{b7}  Enter open the log  \u{b7}  \u{2190}\u{2192} time range"
+                } else {
+                    "Tab next level  \u{b7}  \u{2191}\u{2193} select  \u{b7}  Enter details  \u{b7}  \u{2190}\u{2192} time range"
+                }));
+            }
+        }
+        (Some(v), _) => {
             if let Some(job) = &v.loading {
                 let done = job.progress.load(Ordering::Relaxed);
                 left.push(badge("SCANNING", Color::LightMagenta));
@@ -553,7 +1158,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
                 }
             }
         }
-        None => {
+        (None, None) => {
             if !app.message.is_empty() {
                 left.push(badge("NOTE", Color::LightRed));
                 left.push(Span::styled(
@@ -572,6 +1177,17 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
         }
     }
     let mut right = Vec::new();
+    let hot = Style::new().fg(Color::Black).bg(Color::LightMagenta);
+    if summary.is_some_and(|s| s.detail.is_none() && s.tab != FILES_TAB) {
+        right.push(Span::styled(" ^S ", hot));
+        right.push(Span::styled(" Sort ", Style::new().fg(Color::LightMagenta)));
+    } else if summary.is_none() {
+        right.push(Span::styled(" ^D ", hot));
+        right.push(Span::styled(
+            " Summary ",
+            Style::new().fg(Color::LightMagenta),
+        ));
+    }
     if viewer.is_some() {
         right.push(Span::styled(
             " ^R ",
@@ -597,7 +1213,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
     two_sided(f, area, left, right);
 }
 
-fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
+fn draw_help(f: &mut Frame, area: Rect, screen: Screen) {
     let key = Style::new()
         .fg(Color::LightCyan)
         .add_modifier(Modifier::BOLD);
@@ -641,6 +1257,20 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
         row("Ctrl+U / Ctrl+W", "clear filter / delete last word"),
         row("Ctrl+L", "back to the file list"),
     ];
+    let summary = vec![
+        Line::styled("Summary", head),
+        row("Ctrl+D / F2", "analyse the listed logs (from any screen)"),
+        row("Tab", "next view: ERROR, WARN, INFO, DEBUG, FILES"),
+        row(
+            "\u{2191} \u{2193} Enter",
+            "select a message type, open its details",
+        ),
+        row("  in details", "Enter opens the log at that line"),
+        row("type", "search message types or file names"),
+        row("\u{2190} \u{2192}", "time range (analyses again)"),
+        row("Ctrl+S / Ctrl+R", "sort types / analyse again"),
+        row("Esc", "back"),
+    ];
     let list = vec![
         Line::styled("File list", head),
         row("type", "search names (all words must match)"),
@@ -648,6 +1278,7 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
         row("\u{2190} \u{2192}", "time range: all, 15 min ... 30 days"),
         row("Tab", "type your own From / To date and time"),
         row("Ctrl+S", "sort: newest, name, largest"),
+        row("Ctrl+D / F2", "summary of the listed logs"),
         row("Esc", "clear search, then time range"),
     ];
     let how = match clock::zone_source() {
@@ -665,10 +1296,10 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
         row("--tz UTC", "start with another zone (UTC, local, +08:00)"),
     ];
     let general = vec![row("Ctrl+G / F1", "this help"), row("Ctrl+X", "exit")];
-    let (first, second): (&[Line], &[Line]) = if in_viewer {
-        (&viewer, &list)
-    } else {
-        (&list, &viewer)
+    let (first, second, third): (&[Line], &[Line], &[Line]) = match screen {
+        Screen::Viewer => (&viewer, &summary, &list),
+        Screen::Summary => (&summary, &list, &viewer),
+        Screen::List => (&list, &summary, &viewer),
     };
     let footer = Line::styled(
         format!(
@@ -683,14 +1314,16 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
     let mut right: Vec<Line> = Vec::new();
     left.extend(first.iter().cloned());
     left.push(Line::raw(""));
+    left.extend(second.iter().cloned());
+    left.push(Line::raw(""));
     if wide {
-        right.extend(second.iter().cloned());
+        right.extend(third.iter().cloned());
         right.push(Line::raw(""));
         right.extend(zone);
         right.push(Line::raw(""));
         right.extend(general);
     } else {
-        left.extend(second.iter().cloned());
+        left.extend(third.iter().cloned());
         left.push(Line::raw(""));
         left.extend(zone);
         left.push(Line::raw(""));
