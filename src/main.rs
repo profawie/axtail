@@ -1,14 +1,15 @@
 //! axtail - advanced tail: a fast, read-only terminal log viewer.
 
 mod app;
-mod search;
+mod clock;
+mod filter;
 mod source;
 mod ui;
 mod window;
 
 use std::process::ExitCode;
 
-use search::{Matcher, Mode};
+use filter::Filter;
 
 const USAGE: &str = "\
 axtail {v} - advanced tail for sysadmins (read-only log viewer)
@@ -28,9 +29,9 @@ OPTIONS:
                            .gz and .zip archives. Without a FILTER the usual
                            log folders are searched (/var/log, /opt, /app,
                            /srv, /data, /home, the workdir, ...).
-    --grep <PATTERN>       Advanced search: start with a regex already active
-                           and show the match count of every file in the list.
-    -i, --ignore-case      Make --grep case-insensitive.
+    --grep <PATTERN>       Advanced search: a case-insensitive regex that is
+                           applied as the viewer filter, with the number of
+                           matching lines shown for every file in the list.
     --tail <LINES>         Lines kept in memory for docker/compressed logs
                            (default 10000, max 200000).
     -h, --help             Show this help.
@@ -48,9 +49,11 @@ EXAMPLES:
     axtail --docker myapp --grep 'panic'
 
 KEYS:
-    Up/Down/Left/Right  move      Enter  open log / toggle live
-    Ctrl+F  search (pauses live)  Ctrl+P / Ctrl+N  older / newer match
-    Ctrl+L  back to file list     Ctrl+G  about      Ctrl+X  exit
+    File list   type to search names, Left/Right time range, Tab From/To dates,
+                Up/Down + Enter to open
+    Log viewer  type to filter lines (error timeout, +must, -skip, \"phrase\",
+                /regex/), Up/Down scroll, Enter live/pause, Esc back
+    Anywhere    Ctrl+G help, Ctrl+X exit
 ";
 
 struct Args {
@@ -101,6 +104,7 @@ fn parse_args() -> Result<Option<Args>, String> {
 }
 
 fn main() -> ExitCode {
+    clock::init();
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -114,21 +118,15 @@ fn main() -> ExitCode {
     };
     let grep = match &args.grep {
         None => None,
-        Some(p) => match Matcher::new(
-            p,
-            if args.ignore_case {
-                Mode::RegexNoCase
-            } else {
-                Mode::Regex
-            },
-        ) {
-            Ok(m) => Some(m),
+        Some(p) => match Filter::regex(p, &format!("/{p}/")) {
+            Ok(f) => Some(f),
             Err(e) => {
                 eprintln!("axtail: invalid --grep pattern: {e}");
                 return ExitCode::from(2);
             }
         },
     };
+    let _ = args.ignore_case; // accepted for compatibility: filters ignore case
     let scan = match &args.docker {
         Some(c) => {
             eprintln!("axtail: looking for log files in container {c}...");

@@ -1,4 +1,5 @@
-//! Rendering: header, bordered body, status line and a nano-style key bar.
+//! Rendering: header, filter bar, bordered body and a one-line status bar.
+//! The full key list lives in the help dialog (Ctrl+G) to save space.
 
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -9,14 +10,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 
-use crate::app::{App, Count, PromptKind, Screen, Sort, Viewer};
-use crate::search::Matcher;
+use crate::app::{App, Count, Focus, PRESETS, Screen, Viewer};
+use crate::clock;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Rows available for content: total minus header, borders, status, key bar.
+/// Rows available for content: total minus header, filter bar, borders and
+/// status bar.
 pub fn body_rows(term_height: u16) -> usize {
-    (term_height as usize).saturating_sub(6).max(1)
+    (term_height as usize).saturating_sub(5).max(1)
 }
 
 fn human(n: u64) -> String {
@@ -39,10 +41,10 @@ fn age(t: Option<SystemTime>) -> String {
         return "-".into();
     };
     match secs {
-        0..60 => format!("{secs}s ago"),
-        60..3600 => format!("{}m ago", secs / 60),
-        3600..86400 => format!("{}h ago", secs / 3600),
-        _ => format!("{}d ago", secs / 86400),
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
     }
 }
 
@@ -112,27 +114,19 @@ fn render_line(
     data: &[u8],
     hscroll: usize,
     width: usize,
-    matcher: Option<&Matcher>,
-    current: bool,
+    highlight: Option<&regex::Regex>,
 ) -> Line<'static> {
     let text = sanitize(data);
-    let mut base = level_style(&text);
-    if current {
-        base = base.bg(Color::Indexed(236));
-    }
+    let base = level_style(&text);
     // Byte range of the visible columns.
     let mut idx = text.char_indices().map(|(i, _)| i).skip(hscroll);
     let lo = idx.next().unwrap_or(text.len());
     let hi = idx.nth(width.saturating_sub(1)).unwrap_or(text.len());
-    let hit = Style::new().fg(Color::Black).bg(if current {
-        Color::LightYellow
-    } else {
-        Color::Yellow
-    });
+    let hit = Style::new().fg(Color::Black).bg(Color::Yellow);
     let mut spans = Vec::new();
     let mut pos = lo;
-    if let Some(m) = matcher {
-        for found in m.text.find_iter(&text) {
+    if let Some(re) = highlight {
+        for found in re.find_iter(&text) {
             let (s, e) = (found.start().max(lo), found.end().min(hi));
             if s >= e || s < pos {
                 continue;
@@ -160,12 +154,16 @@ fn badge(text: &str, bg: Color) -> Span<'static> {
     )
 }
 
+const DIM: Style = Style::new().fg(Color::DarkGray);
+const LABEL: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+const CURSOR: &str = "\u{2588}";
+
 pub fn draw(f: &mut Frame, app: &App) {
-    let [header, body, status, keys] = Layout::vertical([
+    let [header, bar, body, status] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(1),
-        Constraint::Length(2),
     ])
     .areas(f.area());
 
@@ -180,16 +178,116 @@ pub fn draw(f: &mut Frame, app: &App) {
         ),
         header,
     );
-
     match viewer {
-        Some(v) => draw_viewer(f, body, v),
-        None => draw_list(f, body, app),
+        Some(v) => {
+            draw_viewer_bar(f, bar, v);
+            draw_viewer(f, body, v);
+        }
+        None => {
+            draw_list_bar(f, bar, app);
+            draw_list(f, body, app);
+        }
     }
     draw_status(f, status, app, viewer);
-    draw_keys(f, keys, app, viewer);
-    if app.about {
-        draw_about(f, f.area());
+    if app.help {
+        draw_help(f, f.area(), viewer.is_some());
     }
+}
+
+/// Renders `left` and right-aligns `right` on the same row.
+fn two_sided(f: &mut Frame, area: Rect, left: Vec<Span<'static>>, right: Vec<Span<'static>>) {
+    let rw: usize = right.iter().map(|s| s.content.chars().count()).sum();
+    let [l, r] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(rw as u16)]).areas(area);
+    f.render_widget(Paragraph::new(Line::from(left)), l);
+    f.render_widget(Paragraph::new(Line::from(right)), r);
+}
+
+fn draw_viewer_bar(f: &mut Frame, area: Rect, v: &Viewer) {
+    let mut left = vec![
+        Span::styled(" Filter \u{25b8} ", LABEL),
+        Span::raw(v.query.clone()),
+        Span::raw(CURSOR),
+    ];
+    if v.query.is_empty() {
+        left.push(Span::styled(
+            " type to show matching lines only: error timeout   +must  -skip  \"exact phrase\"  /regex/",
+            DIM,
+        ));
+    }
+    if let Some(e) = &v.query_error {
+        left.push(Span::styled(
+            format!("   {e}"),
+            Style::new().fg(Color::LightRed),
+        ));
+    }
+    let right = match (&v.filter, v.loading.is_some()) {
+        (Some(_), false) => {
+            let n = v.win.lines.len();
+            let more = if v.win.at_start { "" } else { ", more above" };
+            vec![Span::styled(
+                format!("{n} matching line{}{more} ", if n == 1 { "" } else { "s" }),
+                Style::new().fg(Color::LightYellow),
+            )]
+        }
+        _ => Vec::new(),
+    };
+    two_sided(f, area, left, right);
+}
+
+fn field(text: &str, placeholder: &str, focused: bool) -> Vec<Span<'static>> {
+    let style = if focused {
+        Style::new().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::new().fg(Color::White)
+    };
+    let mut out = if text.is_empty() && !focused {
+        vec![Span::styled(placeholder.to_string(), DIM)]
+    } else {
+        vec![Span::styled(text.to_string(), style)]
+    };
+    if focused {
+        out.push(Span::raw(CURSOR));
+    }
+    out
+}
+
+fn draw_list_bar(f: &mut Frame, area: Rect, app: &App) {
+    let mut left = vec![Span::styled(" Search \u{25b8} ", LABEL)];
+    left.extend(field(
+        &app.search,
+        "type a name",
+        app.focus == Focus::Search,
+    ));
+    let preset = match app.preset {
+        Some(i) => PRESETS[i].0,
+        None => "Custom",
+    };
+    left.push(Span::styled("   Time ", LABEL));
+    left.push(Span::styled(
+        format!("\u{25c2} {preset} \u{25b8}"),
+        Style::new().fg(Color::LightYellow),
+    ));
+    left.push(Span::styled("  From ", LABEL));
+    left.extend(field(&app.from_text, "any", app.focus == Focus::From));
+    left.push(Span::styled("  To ", LABEL));
+    left.extend(field(&app.to_text, "now", app.focus == Focus::To));
+    if app.range_error {
+        left.push(Span::styled(
+            "  use YYYY-MM-DD HH:MM",
+            Style::new().fg(Color::LightRed),
+        ));
+    }
+    let right = vec![Span::styled(
+        format!(
+            "{} of {} ({}) ",
+            app.order.len(),
+            app.sources.len(),
+            clock::zone_label()
+        ),
+        DIM,
+    )];
+    two_sided(f, area, left, right);
 }
 
 fn frame_block(title: String, right: String) -> Block<'static> {
@@ -203,31 +301,25 @@ fn frame_block(title: String, right: String) -> Block<'static> {
 }
 
 fn draw_list(f: &mut Frame, area: Rect, app: &App) {
-    let shown = app.order.len();
-    let total = app.sources.len();
-    let title = if shown == total {
-        format!(" Log files ({total}) ")
-    } else {
-        format!(
-            " Log files ({shown} of {total}, filter: {}) ",
-            app.name_filter
-        )
-    };
-    let block = frame_block(title, format!(" sort: {} ", app.sort.label()));
+    let block = frame_block(
+        format!(" Log files ({}) ", app.order.len()),
+        format!(" sort: {} ", app.sort.label()),
+    );
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height < 2 {
         return;
     }
     let grep = app.grep.is_some();
-    let fixed = 8 + 11 + 10 + if grep { 10 } else { 0 } + 4;
+    let fixed = 1 + 9 + 11 + 17 + 6 + if grep { 10 } else { 0 } + 1;
     let name_w = (inner.width as usize).saturating_sub(fixed).max(8);
     let head = format!(
-        " {:<name_w$} {:<8} {:>10} {:>9}{}",
+        " {:<name_w$} {:<8} {:>10} {:<16} {:>5}{}",
         "NAME",
         "TYPE",
         "SIZE",
         "MODIFIED",
+        "AGE",
         if grep {
             format!(" {:>9}", "MATCHES")
         } else {
@@ -241,8 +333,11 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
     )];
     let rows = inner.height as usize - 1;
-    let top = app.sel.saturating_sub(rows.saturating_sub(1)).min(app.sel);
-    let top = if app.sel >= rows { top } else { 0 };
+    let top = if app.sel >= rows {
+        app.sel + 1 - rows
+    } else {
+        0
+    };
     for (row, &i) in app.order.iter().enumerate().skip(top).take(rows) {
         let s = &app.sources[i];
         let matches = if !grep {
@@ -258,9 +353,11 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         };
         let cell = fit_left(&s.name, name_w);
         let rest = format!(
-            " {:<8} {:>10} {:>9}{}",
+            " {:<8} {:>10} {:<16} {:>5}{}",
             s.type_label(),
             s.size.map_or("-".into(), human),
+            s.modified
+                .map_or("-".into(), |t| clock::format(clock::secs(t))),
             age(s.modified),
             matches
         );
@@ -300,8 +397,8 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     }
     if app.order.is_empty() {
         lines.push(Line::styled(
-            " No log files match.",
-            Style::new().fg(Color::DarkGray),
+            " No log files match the search and time range. Esc clears them.",
+            DIM,
         ));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -330,207 +427,179 @@ fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = inner.width as usize;
-    let lines: Vec<Line> = w
+    let highlight = v.filter.as_ref().and_then(|f| f.highlight.as_ref());
+    let mut lines: Vec<Line> = w
         .lines
         .iter()
         .skip(v.top)
         .take(inner.height as usize)
-        .map(|l| {
-            render_line(
-                &l.data,
-                v.hscroll,
-                width,
-                v.matcher.as_deref(),
-                v.cur_match == Some(l.off),
-            )
-        })
+        .map(|l| render_line(&l.data, v.hscroll, width, highlight))
         .collect();
+    if lines.is_empty() && v.loading.is_none() {
+        let msg = if v.filter.is_some() {
+            if v.live {
+                " No matching lines yet. Waiting for new ones..."
+            } else {
+                " No matching lines."
+            }
+        } else {
+            " (empty)"
+        };
+        lines.push(Line::styled(msg, DIM));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
-    let dim = Style::new().fg(Color::Gray);
-    let mut spans = Vec::new();
-    if let Some(p) = &app.prompt {
-        let label = match p.kind {
-            PromptKind::Search => format!("Search [{}]", p.mode.label()),
-            PromptKind::ListFilter => "Filter by name".to_string(),
-        };
-        spans.push(badge(&label, Color::LightMagenta));
-        spans.push(Span::raw(format!(" {}", p.text)));
-        spans.push(Span::styled(
-            "_",
-            Style::new().add_modifier(Modifier::SLOW_BLINK),
-        ));
-        if let Some(v) = viewer.filter(|v| !v.notice.is_empty()) {
-            spans.push(Span::styled(
-                format!("   {}", v.notice),
-                Style::new().fg(Color::LightRed),
-            ));
-        }
-    } else if let Some(v) = viewer {
-        let job = v.searching.as_ref().or(v.loading.as_ref());
-        if let Some(job) = job {
-            let done = job.progress.load(Ordering::Relaxed);
-            spans.push(badge(&job.label.to_uppercase(), Color::LightMagenta));
-            spans.push(Span::styled(
-                format!(" {} scanned, Esc to cancel", human(done)),
-                dim,
-            ));
-        } else if v.live {
-            spans.push(badge("LIVE", Color::LightGreen));
-            spans.push(Span::styled(" streaming in real time", dim));
-        } else if v.src.can_live() {
-            spans.push(badge("PAUSED", Color::Yellow));
-            spans.push(Span::styled(" Enter resumes live", dim));
-        } else {
-            spans.push(badge("STATIC", Color::Gray));
-            spans.push(Span::styled(" compressed log", dim));
-        }
-        if let Some(m) = &v.matcher {
-            spans.push(Span::styled(
-                format!("  search: \"{}\" [{}]", m.query, m.mode.label()),
-                Style::new().fg(Color::LightYellow),
-            ));
-        }
-        if !v.notice.is_empty() {
-            spans.push(Span::styled(
-                format!("  {}", v.notice),
-                Style::new().fg(Color::LightCyan),
-            ));
-        }
-    } else {
-        spans.push(badge("LIST", Color::Cyan));
-        if let Some(m) = &app.grep {
-            let pending = app
-                .counts
-                .iter()
-                .filter(|c| matches!(c, Count::Pending))
-                .count();
-            let state = if pending > 0 && app.sort != Sort::Matches {
-                ", counting..."
+    let mut left = Vec::new();
+    let tip = |t: &str| Span::styled(format!(" {t}"), Style::new().fg(Color::Gray));
+    match viewer {
+        Some(v) => {
+            if let Some(job) = &v.loading {
+                let done = job.progress.load(Ordering::Relaxed);
+                left.push(badge("SCANNING", Color::LightMagenta));
+                left.push(tip(&format!("{} read  \u{b7}  Esc cancels", human(done))));
             } else {
-                ""
-            };
-            spans.push(Span::styled(
-                format!(" grep: \"{}\" [{}]{state}", m.query, m.mode.label()),
-                Style::new().fg(Color::LightYellow),
-            ));
+                if v.live {
+                    left.push(badge("LIVE", Color::LightGreen));
+                } else if v.src.can_live() {
+                    left.push(badge("PAUSED", Color::Yellow));
+                } else {
+                    left.push(badge("STATIC", Color::Gray));
+                }
+                if !v.notice.is_empty() {
+                    left.push(Span::styled(
+                        format!(" {}", v.notice),
+                        Style::new().fg(Color::LightCyan),
+                    ));
+                } else if v.filter.is_some() {
+                    left.push(tip(
+                        "only matching lines are shown  \u{b7}  Esc clears the filter",
+                    ));
+                } else if v.live {
+                    left.push(tip("type to filter  \u{b7}  \u{2191} pauses to scroll  \u{b7}  Esc back to list"));
+                } else if v.src.can_live() {
+                    left.push(tip("Enter or End resumes live  \u{b7}  type to filter  \u{b7}  Esc back to list"));
+                } else {
+                    left.push(tip(
+                        "type to filter  \u{b7}  Home/End jump  \u{b7}  Esc back to list",
+                    ));
+                }
+            }
         }
-        if !app.message.is_empty() {
-            spans.push(Span::styled(
-                format!("  {}", app.message),
-                Style::new().fg(Color::LightRed),
-            ));
-        } else {
-            spans.push(Span::styled(" select a log and press Enter", dim));
+        None => {
+            if !app.message.is_empty() {
+                left.push(badge("NOTE", Color::LightRed));
+                left.push(Span::styled(
+                    format!(" {}", app.message),
+                    Style::new().fg(Color::LightRed),
+                ));
+            } else {
+                left.push(badge("FILES", Color::Cyan));
+                left.push(tip(match app.focus {
+                    Focus::Search => {
+                        "\u{2191}\u{2193} select  \u{b7}  Enter open  \u{b7}  type to search  \u{b7}  \u{2190}\u{2192} time range  \u{b7}  Tab dates"
+                    }
+                    _ => "type a date: 2026-11-22 13:00  \u{b7}  Tab next field  \u{b7}  Esc back to search",
+                }));
+            }
         }
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn draw_keys(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
-    let keys: &[(&str, &str)] = if let Some(p) = &app.prompt {
-        match p.kind {
-            PromptKind::Search => &[
-                ("Enter", "Search"),
-                ("Tab", "Change Mode"),
-                ("Esc", "Cancel"),
-                ("^X", "Exit"),
-            ],
-            PromptKind::ListFilter => &[("Enter", "Apply"), ("Esc", "Clear"), ("^X", "Exit")],
-        }
-    } else if viewer.is_some() {
-        &[
-            ("^F", "Search"),
-            ("^P", "Older Match"),
-            ("^N", "Newer Match"),
-            ("Enter", "Live/Pause"),
-            ("^L", "File List"),
-            ("Up/Dn", "Scroll"),
-            ("Lt/Rt", "Pan"),
-            ("Home/End", "Top/Bottom"),
-            ("^G", "About"),
-            ("^X", "Exit"),
-        ]
-    } else {
-        &[
-            ("Enter", "Open Log"),
-            ("Up/Dn", "Select"),
-            ("Lt/Rt", "Sort"),
-            ("^F", "Filter Names"),
-            ("^G", "About"),
-            ("^X", "Exit"),
-        ]
-    };
-    let per_row = keys.len().div_ceil(2).max(1);
-    let cell = (area.width as usize / per_row).max(1);
-    let key_style = Style::new()
-        .fg(Color::Black)
-        .bg(Color::Gray)
-        .add_modifier(Modifier::BOLD);
-    let lines: Vec<Line> = keys
-        .chunks(per_row)
-        .map(|row| {
-            let mut spans = Vec::new();
-            for (k, label) in row {
-                let pad = cell.saturating_sub(k.len() + 1);
-                spans.push(Span::styled(k.to_string(), key_style));
-                spans.push(Span::raw(format!(
-                    " {:<pad$}",
-                    label.chars().take(pad).collect::<String>()
-                )));
-            }
-            Line::from(spans)
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-fn draw_about(f: &mut Frame, area: Rect) {
-    let text = [
-        "",
-        &format!("axtail {VERSION}"),
-        "advanced tail for sysadmins",
-        "",
-        "Find the root cause in plain, gzip, zip",
-        "and Docker logs, straight from a terminal.",
-        "",
-        "Read-only: axtail never writes to a log.",
-        "Bounded memory: files are never loaded whole.",
-        "",
-        "Written in Rust.",
-        env!("CARGO_PKG_REPOSITORY"),
-        "",
-        "Press any key to close",
+    let right = vec![
+        Span::styled(" ^G ", Style::new().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" Help ", Style::new().fg(Color::Gray)),
+        Span::styled(" ^X ", Style::new().fg(Color::Black).bg(Color::Gray)),
+        Span::styled(" Exit ", Style::new().fg(Color::Gray)),
     ];
-    let (w, h) = (52.min(area.width), (text.len() as u16 + 2).min(area.height));
+    two_sided(f, area, left, right);
+}
+
+fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
+    let key = Style::new()
+        .fg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD);
+    let head = Style::new()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let row = |k: &str, d: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<16}"), key),
+            Span::raw(d.to_string()),
+        ])
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!("axtail {VERSION}  \u{b7}  advanced tail for sysadmins"),
+            Style::new()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "Read-only. Bounded memory: logs are never loaded whole.",
+            DIM,
+        ),
+        Line::raw(""),
+    ];
+    let viewer = [
+        Line::styled("Log viewer", head),
+        row("type", "filter lines (applies as you type)"),
+        row("  error timeout", "lines with error OR timeout"),
+        row("  +db -health", "must contain db / must not contain health"),
+        row(
+            "  \"conn reset\"",
+            "exact phrase      /regex/  regular expression",
+        ),
+        row("Esc", "clear filter, then back to the file list"),
+        row("\u{2191} \u{2193} PgUp PgDn", "scroll (pauses live)"),
+        row("Enter", "pause / resume live"),
+        row("Home / End", "start / end (End resumes live)"),
+        row("\u{2190} \u{2192}", "pan long lines"),
+        row("Ctrl+U / Ctrl+W", "clear filter / delete last word"),
+        row("Ctrl+L", "back to the file list"),
+    ];
+    let list = [
+        Line::styled("File list", head),
+        row("type", "search names (all words must match)"),
+        row("\u{2191} \u{2193} Enter", "select and open a log"),
+        row("\u{2190} \u{2192}", "time range: all, 15 min ... 30 days"),
+        row("Tab", "type your own From / To date and time"),
+        row("Ctrl+S", "sort: newest, name, largest"),
+        row("Esc", "clear search, then time range"),
+    ];
+    if in_viewer {
+        lines.extend(viewer);
+        lines.push(Line::raw(""));
+        lines.extend(list);
+    } else {
+        lines.extend(list);
+        lines.push(Line::raw(""));
+        lines.extend(viewer);
+    }
+    lines.push(Line::raw(""));
+    lines.push(row("Ctrl+G / F1", "this help"));
+    lines.push(row("Ctrl+X", "exit"));
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!(
+            "{}  \u{b7}  press any key to close",
+            env!("CARGO_PKG_REPOSITORY")
+        ),
+        DIM,
+    ));
+    let w = 70.min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect::new(
         area.x + (area.width - w) / 2,
         area.y + (area.height - h) / 2,
         w,
         h,
     );
-    let lines: Vec<Line> = text
-        .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let style = match i {
-                1 => Style::new()
-                    .fg(Color::LightCyan)
-                    .add_modifier(Modifier::BOLD),
-                13 => Style::new().fg(Color::DarkGray),
-                _ => Style::new(),
-            };
-            Line::styled(t.to_string(), style).centered()
-        })
-        .collect();
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
                 .border_style(Style::new().fg(Color::LightCyan))
-                .title(" About "),
+                .title(" Help \u{b7} About "),
         ),
         rect,
     );
