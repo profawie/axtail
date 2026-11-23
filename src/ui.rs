@@ -109,6 +109,40 @@ fn level_style(line: &str) -> Style {
     }
 }
 
+/// Builds the spans for the byte range `lo..hi` of `text`, highlighting matches.
+fn row_spans(
+    text: &str,
+    lo: usize,
+    hi: usize,
+    base: Style,
+    hits: &[(usize, usize)],
+) -> Line<'static> {
+    let hit = Style::new().fg(Color::Black).bg(Color::Yellow);
+    let mut spans = Vec::new();
+    let mut pos = lo;
+    for &(s, e) in hits {
+        let (s, e) = (s.max(lo), e.min(hi));
+        if s >= e || s < pos {
+            continue;
+        }
+        if s > pos {
+            spans.push(Span::styled(text[pos..s].to_string(), base));
+        }
+        spans.push(Span::styled(text[s..e].to_string(), hit));
+        pos = e;
+    }
+    if pos < hi {
+        spans.push(Span::styled(text[pos..hi].to_string(), base));
+    }
+    Line::from(spans).style(base)
+}
+
+fn matches(text: &str, highlight: Option<&regex::Regex>) -> Vec<(usize, usize)> {
+    highlight.map_or_else(Vec::new, |re| {
+        re.find_iter(text).map(|m| (m.start(), m.end())).collect()
+    })
+}
+
 /// Builds one visible row: horizontal scroll, level colour, match highlight.
 fn render_line(
     data: &[u8],
@@ -122,26 +156,37 @@ fn render_line(
     let mut idx = text.char_indices().map(|(i, _)| i).skip(hscroll);
     let lo = idx.next().unwrap_or(text.len());
     let hi = idx.nth(width.saturating_sub(1)).unwrap_or(text.len());
-    let hit = Style::new().fg(Color::Black).bg(Color::Yellow);
-    let mut spans = Vec::new();
-    let mut pos = lo;
-    if let Some(re) = highlight {
-        for found in re.find_iter(&text) {
-            let (s, e) = (found.start().max(lo), found.end().min(hi));
-            if s >= e || s < pos {
-                continue;
-            }
-            if s > pos {
-                spans.push(Span::styled(text[pos..s].to_string(), base));
-            }
-            spans.push(Span::styled(text[s..e].to_string(), hit));
-            pos = e;
-        }
+    row_spans(&text, lo, hi, base, &matches(&text, highlight))
+}
+
+/// Builds all the rows of one log line, broken at the terminal width.
+fn wrap_line(data: &[u8], width: usize, highlight: Option<&regex::Regex>) -> Vec<Line<'static>> {
+    let text = sanitize(data);
+    let base = level_style(&text);
+    let hits = matches(&text, highlight);
+    let width = width.max(1);
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).step_by(width).collect();
+    if starts.is_empty() {
+        return vec![Line::raw("").style(base)];
     }
-    if pos < hi {
-        spans.push(Span::styled(text[pos..hi].to_string(), base));
-    }
-    Line::from(spans).style(base)
+    starts
+        .iter()
+        .enumerate()
+        .map(|(n, &lo)| {
+            let hi = starts.get(n + 1).copied().unwrap_or(text.len());
+            row_spans(&text, lo, hi, base, &hits)
+        })
+        .collect()
+}
+
+/// How many screen rows a log line takes when wrapped at `width` columns.
+pub fn wrapped_rows(data: &[u8], width: usize) -> usize {
+    sanitize(data).chars().count().div_ceil(width.max(1)).max(1)
+}
+
+/// Text columns inside the viewer's border.
+pub fn body_cols(term_width: u16) -> usize {
+    term_width.saturating_sub(2) as usize
 }
 
 fn badge(text: &str, bg: Color) -> Span<'static> {
@@ -181,7 +226,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match viewer {
         Some(v) => {
             draw_viewer_bar(f, bar, v);
-            draw_viewer(f, body, v);
+            draw_viewer(f, body, v, app.wrap);
         }
         None => {
             draw_list_bar(f, bar, app);
@@ -399,7 +444,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer) {
+fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer, wrap: bool) {
     let w = &v.win;
     let pos = match (w.lines.get(v.top), v.src.size, w.relative) {
         (Some(l), Some(size), false) if size > 0 && v.src.plain_path().is_some() => {
@@ -413,7 +458,7 @@ fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer) {
         (Some(l), _, false) => format!(" at {} ", human(l.off)),
         _ => String::new(),
     };
-    let col = if v.hscroll > 0 {
+    let col = if v.hscroll > 0 && !wrap {
         format!(" col {} ", v.hscroll + 1)
     } else {
         String::new()
@@ -423,13 +468,39 @@ fn draw_viewer(f: &mut Frame, area: Rect, v: &Viewer) {
     f.render_widget(block, area);
     let width = inner.width as usize;
     let highlight = v.filter.as_ref().and_then(|f| f.highlight.as_ref());
-    let mut lines: Vec<Line> = w
-        .lines
-        .iter()
-        .skip(v.top)
-        .take(inner.height as usize)
-        .map(|l| render_line(&l.data, v.hscroll, width, highlight))
-        .collect();
+    let height = inner.height as usize;
+    let mut lines: Vec<Line> = if !wrap {
+        w.lines
+            .iter()
+            .skip(v.top)
+            .take(height)
+            .map(|l| render_line(&l.data, v.hscroll, width, highlight))
+            .collect()
+    } else if v.pinned {
+        // At the end: fill from the bottom so the newest line is always whole.
+        let mut rows: Vec<Line> = Vec::new();
+        for l in w.lines.iter().rev() {
+            if rows.len() >= height {
+                break;
+            }
+            let mut part = wrap_line(&l.data, width, highlight);
+            part.reverse();
+            rows.extend(part);
+        }
+        rows.truncate(height);
+        rows.reverse();
+        rows
+    } else {
+        let mut rows: Vec<Line> = Vec::new();
+        for l in w.lines.iter().skip(v.top) {
+            if rows.len() >= height {
+                break;
+            }
+            rows.extend(wrap_line(&l.data, width, highlight));
+        }
+        rows.truncate(height);
+        rows
+    };
     if lines.is_empty() && v.loading.is_none() {
         let msg = if v.filter.is_some() {
             if v.live {
@@ -500,7 +571,19 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
             }
         }
     }
-    let right = vec![
+    let mut right = Vec::new();
+    if viewer.is_some() {
+        right.push(Span::styled(
+            " ^R ",
+            Style::new().fg(Color::Black).bg(Color::Gray),
+        ));
+        right.push(Span::styled(
+            if app.wrap { " Wrap " } else { " No wrap " },
+            Style::new().fg(Color::LightCyan),
+        ));
+        right.push(Span::raw(" "));
+    }
+    right.extend([
         Span::styled("\u{25f7} ", Style::new().fg(Color::Gray)),
         Span::styled(
             format!("{} ", clock::zone_label()),
@@ -510,7 +593,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App, viewer: Option<&Viewer>) {
         Span::styled(" Help ", Style::new().fg(Color::Gray)),
         Span::styled(" ^X ", Style::new().fg(Color::Black).bg(Color::Gray)),
         Span::styled(" Exit ", Style::new().fg(Color::Gray)),
-    ];
+    ]);
     two_sided(f, area, left, right);
 }
 
@@ -553,7 +636,8 @@ fn draw_help(f: &mut Frame, area: Rect, in_viewer: bool) {
         row("\u{2191} \u{2193} PgUp PgDn", "scroll (pauses live)"),
         row("Enter", "pause / resume live"),
         row("Home / End", "start / end (End resumes live)"),
-        row("\u{2190} \u{2192}", "pan long lines"),
+        row("Ctrl+R", "wrap long lines on / off (default: wrap)"),
+        row("\u{2190} \u{2192}", "pan long lines (when wrap is off)"),
         row("Ctrl+U / Ctrl+W", "clear filter / delete last word"),
         row("Ctrl+L", "back to the file list"),
     ];
