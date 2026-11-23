@@ -105,6 +105,8 @@ pub struct Viewer {
     pub top: usize,
     pub hscroll: usize,
     pub live: bool,
+    /// The view is held at the end (newest line at the bottom).
+    pub pinned: bool,
     follower: Option<Follower>,
     pub loading: Option<Job>,
     after: After,
@@ -180,6 +182,10 @@ pub struct App {
     pub screen: Screen,
     pub viewer: Option<Viewer>,
     pub help: bool,
+    /// Wrap long lines in the viewer (Ctrl+R toggles).
+    pub wrap: bool,
+    /// Text columns of the viewer body.
+    pub cols: usize,
     // File list filters.
     pub search: String,
     pub focus: Focus,
@@ -256,6 +262,8 @@ impl App {
             screen: Screen::List,
             viewer: None,
             help: false,
+            wrap: true,
+            cols: 78,
             search: String::new(),
             focus: Focus::Search,
             preset: Some(0),
@@ -502,12 +510,16 @@ impl App {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         if self.sources.len() == 1 {
-            self.rows = ui::body_rows(terminal.size()?.height);
+            let size = terminal.size()?;
+            self.rows = ui::body_rows(size.height);
+            self.cols = ui::body_cols(size.width);
             self.open(0);
         }
         let mut dirty = true;
         while !self.quit {
-            self.rows = ui::body_rows(terminal.size()?.height);
+            let size = terminal.size()?;
+            self.rows = ui::body_rows(size.height);
+            self.cols = ui::body_cols(size.width);
             if dirty {
                 terminal.draw(|f| ui::draw(f, self))?;
                 dirty = false;
@@ -599,6 +611,17 @@ impl App {
             KeyCode::Down => self.scroll(1),
             KeyCode::PageUp => self.scroll(-page),
             KeyCode::PageDown => self.scroll(page),
+            KeyCode::Char('r') if ctrl(&key, 'r') => {
+                self.wrap = !self.wrap;
+                v.notice = if self.wrap {
+                    "Wrap on: long lines continue on the next rows".into()
+                } else {
+                    "Wrap off: use \u{2190} \u{2192} to pan long lines".into()
+                };
+            }
+            KeyCode::Left | KeyCode::Right if self.wrap => {
+                v.notice = "Wrap is on, nothing to pan. Ctrl+R turns it off".into();
+            }
             KeyCode::Left => v.hscroll = v.hscroll.saturating_sub(16),
             KeyCode::Right => v.hscroll = (v.hscroll + 16).min(window::MAX_LINE),
             KeyCode::Home => {
@@ -708,6 +731,7 @@ impl App {
             top: 0,
             hscroll: 0,
             live: false,
+            pinned: true,
             follower: None,
             loading: None,
             after: After::Bottom,
@@ -750,6 +774,7 @@ impl App {
                 Ok(w) => {
                     v.win = w;
                     v.live = true;
+                    v.pinned = true;
                     v.top = v.win.lines.len().saturating_sub(rows);
                 }
                 Err(e) => v.notice = err_text(&e),
@@ -763,6 +788,7 @@ impl App {
                         ..Default::default()
                     };
                     v.top = 0;
+                    v.pinned = true;
                     v.follower = Some(Follower::spawn(reader, killer, v.filter.clone()));
                     v.live = true;
                 }
@@ -818,8 +844,12 @@ impl App {
         let max_top = len.saturating_sub(rows) as isize;
         let place =
             |idx: usize, delta: isize| (idx as isize + delta).clamp(0, max_top.max(0)) as usize;
+        v.pinned = false;
         match after {
-            After::Bottom => v.top = max_top as usize,
+            After::Bottom => {
+                v.top = max_top as usize;
+                v.pinned = true;
+            }
             After::Top => v.top = 0,
             After::Anchor { off, delta } => v.top = place(v.win.index_of(off), delta),
             After::AnchorContent { data, delta } => {
@@ -843,9 +873,32 @@ impl App {
         if v.live {
             self.set_live(false);
         }
+        let (wrap, cols) = (self.wrap, self.cols);
         let v = self.viewer.as_mut().unwrap();
-        let max_top = v.win.lines.len().saturating_sub(rows) as isize;
-        let want = v.top as isize + delta;
+        let len = v.win.lines.len();
+        let max_top = len.saturating_sub(rows) as isize;
+        let mut want = v.top as isize + delta;
+        if v.pinned {
+            if delta > 0 && v.win.at_end {
+                return;
+            }
+            if wrap && delta < 0 {
+                // Leave the bottom-filled view from the line now at its top.
+                let (mut used, mut first) = (0, len);
+                while first > 0 && used < rows {
+                    first -= 1;
+                    used += ui::wrapped_rows(&v.win.lines[first].data, cols);
+                }
+                let cut = used > rows;
+                want = first as isize + delta + cut as isize;
+            }
+            v.pinned = false;
+        }
+        if want >= max_top && v.win.at_end && delta > 0 {
+            v.top = max_top.max(0) as usize;
+            v.pinned = true;
+            return;
+        }
         let needs_more = (want < 0 && !v.win.at_start) || (want > max_top && !v.win.at_end);
         let Some(top_line) = v.win.lines.get(v.top).filter(|_| needs_more) else {
             v.top = want.clamp(0, max_top) as usize;

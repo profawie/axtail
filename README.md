@@ -27,6 +27,8 @@ and Docker container logs, all in one coloured text interface.
 - **Time zone aware.** The machine's time zone is detected at start and shown at the bottom
   right (for example `UTC+08:00 Asia/Kuala_Lumpur`). File times and the From / To range use it;
   `--tz UTC` switches zone when the logs are written in another one.
+- **Whole lines visible.** Long lines wrap onto the next rows by default, so the end of a
+  line is never cut off. `Ctrl+R` switches to one row per line with `Left`/`Right` panning.
 - **Multi-GB files.** Files are never loaded whole. axtail seeks from the end and reads
   only a small window around what is on screen.
 - **gzip and zip.** Archives are stream-decompressed in memory, never extracted to disk.
@@ -117,7 +119,8 @@ range, so for each folder the first file modified after "To" is listed too.
 | `Up` / `Down`, `PageUp` / `PageDown` | Scroll (pauses live) |
 | `Enter` | Pause / resume live |
 | `Home` / `End` | Jump to the start / back to the end (live) |
-| `Left` / `Right` | Pan long lines |
+| `Ctrl+R` | Wrap long lines on / off. Wrap is on by default; the bottom bar shows `Wrap` or `No wrap` |
+| `Left` / `Right` | Pan long lines (when wrap is off) |
 | `Ctrl+U` / `Ctrl+W` | Clear the filter / delete its last word |
 | `Esc` | Cancel a running scan, clear the filter, or go back to the list |
 | `Ctrl+L` | Back to the file list |
