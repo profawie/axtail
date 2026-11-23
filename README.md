@@ -4,15 +4,78 @@
 It helps you find the root cause in log files over SSH: plain files, gzip, zip
 and Docker container logs, all in one coloured text interface.
 
+## Install on a Linux server
+
+One line, straight from GitHub. The server needs no Rust, only `curl` (or `wget`):
+
+```sh
+# system-wide for all users: /usr/local/bin/axtail
+curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sudo sh
+
+# current user only, no root: ~/.local/bin/axtail
+curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sh
 ```
- axtail 0.1.2 - /var/log/app/api.log
- Filter ▸ error timeout█                                         37 matching lines
-┌ text ─────────────────────────────────────── 260.4 MB / 521.8 MB (49%) ┐
-│2026-11-22T06:19:59Z ERROR [worker-15] upstream timeout after 30000ms   │
-│2026-11-22 FATAL database connection pool exhausted: timeout            │
-└────────────────────────────────────────────────────────────────────────┘
- LIVE  only matching lines are shown  ·  Esc clears the filter    ^G Help  ^X Exit
+
+This downloads the static binary for the server's CPU (x86_64 or aarch64) from the
+[latest release](https://github.com/profawie/axtail/releases/latest), verifies it against
+the release's `SHA256SUMS`, and installs it. Run the same command again to upgrade.
+Options go after `sh -s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sh -s -- --version v0.1.0
+curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sudo sh -s -- --uninstall
 ```
+
+| Option | Result |
+| --- | --- |
+| `--dir <DIR>` | Install into a specific directory |
+| `--version <TAG>` | Install a specific release instead of the latest |
+| `--download` | Always download, even when an `axtail` file sits next to the script |
+| `--uninstall` | Remove axtail (use `sudo` or `--dir` the same way it was installed) |
+
+**Servers without internet access.** Copy two files and run the script there. It installs
+the `axtail` file next to it instead of downloading:
+
+```sh
+./build.sh                                # or download the binary from the releases page
+scp axtail install.sh user@server:/tmp/
+ssh user@server sudo /tmp/install.sh
+```
+
+Inside a clone on a machine with Rust, `./install.sh` builds the binary first if it is
+missing. The script refuses to install a binary that does not run on the machine.
+
+**Windows.** Download `axtail-windows-x86_64.exe` from the
+[releases page](https://github.com/profawie/axtail/releases/latest), or build with `.\build.ps1`.
+
+## Screenshots
+
+All screenshots use made-up demo logs.
+
+**File list.** Point axtail at a folder: plain logs, `.gz` archives and the files inside a
+`.zip` are listed together, newest first, with size, modified time and age.
+
+![File list with plain, gzip and zip logs](docs/screenshots/file-list.png)
+
+**Time range.** Press `Left` / `Right` to pick a range (here: last 3 days) or `Tab` to type
+your own From / To. The list updates as you go, in the time zone shown at the bottom right.
+
+![File list limited to the last 3 days](docs/screenshots/time-range.png)
+
+**Live view.** The log follows new lines in real time. Errors are red, warnings yellow,
+debug grey. Long lines wrap so nothing is cut off (`Ctrl+R` turns wrap off).
+
+![Live log view](docs/screenshots/live-viewer.png)
+
+**Filter.** Just type. `error timeout` keeps only the lines with either word and
+highlights the matches, while the log keeps streaming.
+
+![Live log filtered by error timeout](docs/screenshots/filter.png)
+
+**Help.** `Ctrl+G` shows every key, the filter syntax and the time zone in use.
+
+![Help dialog](docs/screenshots/help.png)
+
 
 ## Features
 
@@ -174,50 +237,6 @@ dependencies are pure Rust. To force a toolchain:
 ```
 
 If rustup asks about Visual Studio during installation, choose to continue without it.
-
-## Install on a Linux server
-
-One line, straight from GitHub. The server needs no Rust, only `curl` (or `wget`):
-
-```sh
-# system-wide for all users: /usr/local/bin/axtail
-curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sudo sh
-
-# current user only, no root: ~/.local/bin/axtail
-curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sh
-```
-
-This downloads the static binary for the server's CPU (x86_64 or aarch64) from the
-[latest release](https://github.com/profawie/axtail/releases/latest), verifies it against
-the release's `SHA256SUMS`, and installs it. Run the same command again to upgrade.
-Options go after `sh -s --`:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sh -s -- --version v0.1.0
-curl -fsSL https://raw.githubusercontent.com/profawie/axtail/main/install.sh | sudo sh -s -- --uninstall
-```
-
-| Option | Result |
-| --- | --- |
-| `--dir <DIR>` | Install into a specific directory |
-| `--version <TAG>` | Install a specific release instead of the latest |
-| `--download` | Always download, even when an `axtail` file sits next to the script |
-| `--uninstall` | Remove axtail (use `sudo` or `--dir` the same way it was installed) |
-
-**Servers without internet access.** Copy two files and run the script there. It installs
-the `axtail` file next to it instead of downloading:
-
-```sh
-./build.sh                                # or download the binary from the releases page
-scp axtail install.sh user@server:/tmp/
-ssh user@server sudo /tmp/install.sh
-```
-
-Inside a clone on a machine with Rust, `./install.sh` builds the binary first if it is
-missing. The script refuses to install a binary that does not run on the machine.
-
-**Windows.** Download `axtail-windows-x86_64.exe` from the
-[releases page](https://github.com/profawie/axtail/releases/latest), or build with `.\build.ps1`.
 
 ### Publishing a release
 
