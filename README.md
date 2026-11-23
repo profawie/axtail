@@ -72,6 +72,21 @@ highlights the matches, while the log keeps streaming.
 
 ![Live log filtered by error timeout](docs/screenshots/filter.png)
 
+**Summary.** `Ctrl+D` analyses every listed log and counts the lines per level. Errors
+are split into message types: the same failure thrown many times is one row, with the
+changing parts (numbers, ids, addresses) shown as placeholders such as `<n>` and `<ip>`.
+
+![Summary dashboard with level counts and error types](docs/screenshots/summary.png)
+
+**Error details.** `Enter` on a type shows its count, first and last time, the stack trace
+and every occurrence with timestamp, file and line. `Enter` again opens the log at that line.
+
+![Details of one error type with its occurrences](docs/screenshots/summary-details.png)
+
+**Per file.** `Tab` walks through ERROR, WARN, INFO, DEBUG and a per-file breakdown.
+
+![Level counts per file](docs/screenshots/summary-files.png)
+
 **Help.** `Ctrl+G` shows every key, the filter syntax and the time zone in use.
 
 ![Help dialog](docs/screenshots/help.png)
@@ -83,6 +98,10 @@ highlights the matches, while the log keeps streaming.
 - **Logcat-style filter.** Type in the viewer and only matching lines are shown, live or
   paused: `error timeout` shows lines with either word; `+must`, `-skip`, `"exact phrase"`
   and `/regex/` refine it. The filter searches the whole log, not just what is on screen.
+- **Summary dashboard.** `Ctrl+D` analyses all listed logs: lines per level (ERROR, WARN,
+  INFO, DEBUG), messages grouped into types, and for each type the count, first and last
+  time, stack trace and every occurrence with timestamp, file and line. `Enter` on an
+  occurrence opens the log at that exact line. Text and numbers only, colour-coded per level.
 - **File list with search and time range.** Type to search names, `Left`/`Right` to pick a
   time range (last 15 min ... 30 days), or `Tab` to type your own From / To date and time.
 - **Uncluttered screen.** The bottom line shows only the current state, a tip and the time
@@ -167,12 +186,46 @@ list and About; any key closes it. `Ctrl+X` exits.
 | `Up` / `Down`, `PageUp` / `PageDown` | Select a log |
 | `Enter` | Open the selected log |
 | `Ctrl+S` | Sort: newest, name, largest (and matches with `--grep`) |
+| `Ctrl+D` / `F2` | Summary of the listed logs |
 | `Ctrl+U` / `Ctrl+W` | Clear the field / delete the last word |
 | `Esc` | Leave the date field, then clear the search, then the time range |
 
 The time range uses each file's modification time in the local time zone (shown at the
 right of the bar). A log modified just after "To" can still hold lines from inside the
 range, so for each folder the first file modified after "To" is listed too.
+
+**Summary** (`Ctrl+D` or `F2` from any screen)
+
+| Key | Action |
+| --- | --- |
+| `Tab` / `Shift+Tab` | Next / previous view: ERROR, WARN, INFO, DEBUG, FILES |
+| `Up` / `Down`, `PageUp` / `PageDown` | Select a message type (or a file) |
+| `Enter` | Open the details of the type; in FILES, open the log |
+| type | Search message types or file names |
+| `Left` / `Right` | Time range (the analysis runs again) |
+| `Ctrl+S` | Sort types: count, last seen, first seen |
+| `Ctrl+R` | Analyse again |
+| `Esc` | Cancel a running analysis, clear the search, or go back to the list |
+
+In the details of a type: `Up` / `Down` select an occurrence, `Enter` opens the log at that
+line (highlighted, with `Esc` returning to the summary), `Left` / `Right` move to the
+previous / next type and `Esc` goes back.
+
+How the summary reads a log:
+
+- It covers the files shown in the list, so the name search and time range apply. With a
+  time range, only lines whose own timestamp is inside the range are counted.
+- The level is the first level word of a line (`ERROR`, `WARN`, `INFO`, `DEBUG` and
+  relatives such as `FATAL`, `WARNING`, `NOTICE`, `TRACE`), the `level` field of JSON and
+  logfmt lines, or the HTTP status of an access log line (5xx error, 4xx warning).
+- Timestamps are read from the line: `2026-11-22 13:05:09`, ISO 8601 with or without a
+  zone, `22/Nov/2026:13:05:09 +0800`, syslog `Nov 22 13:05:09`, and JSON `time` / `ts`
+  fields. A timestamp without a zone is taken to be in the zone shown at the bottom right
+  (`--tz` changes it).
+- Lines that follow an entry without a timestamp of their own (stack traces) belong to
+  that entry and are not counted separately.
+- Placeholders in a type: `<n>` number, `<ip>` address, `<uuid>`, `<hex>`, `<id>` generated
+  id, `'<*>'` a quoted value.
 
 **Log viewer**
 
@@ -264,6 +317,11 @@ Run the tests with `cargo test`.
   are kept, and live updates read only the new bytes, so a filtered live view of a busy
   log costs little. On this project's test machine a 522 MB file took about 0.13 s when
   cached; a cold disk runs at disk speed.
+- **The summary** streams each log once on a background thread, with progress and `Esc`
+  to cancel, at roughly 130 MB (1.4 million lines) per second on this project's test
+  machine. Memory is bounded: at most 1,000 error and warning types and 400 info and debug
+  types are kept (the rest share one row), each with its latest 300 or 100 occurrences,
+  under a 48 MB cap.
 - **Live Docker with a filter** filters on the follower thread, so only matching lines
   reach the screen. It starts from the last `--tail` lines; scroll up to scan the full
   `docker logs` history.
@@ -304,3 +362,5 @@ Run the tests with `cargo test`.
   are not scanned recursively.
 - Only stored and deflate zip entries are supported; encrypted entries are skipped.
 - Positions in compressed and Docker logs are shown as byte offsets, without line numbers.
+- The summary recognises common log formats, not every one: a line with no level word
+  counts as "no level", and a time zone is a fixed offset (no daylight saving rules).
