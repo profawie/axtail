@@ -5,20 +5,112 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
 
-static OFFSET: OnceLock<UtcOffset> = OnceLock::new();
+struct Zone {
+    offset: UtcOffset,
+    /// IANA name such as "Asia/Kuala_Lumpur", when it can be found.
+    name: Option<String>,
+    /// Where the zone came from: "system", "--tz" or "AXTAIL_TZ".
+    source: &'static str,
+}
 
-/// Reads the local time zone offset. Call once at startup, before any
-/// thread is spawned (the platform lookup is only reliable then).
-pub fn init() {
-    OFFSET.get_or_init(|| UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+static ZONE: OnceLock<Zone> = OnceLock::new();
+
+/// Picks the time zone used for every date shown or typed: `--tz`, else
+/// the `AXTAIL_TZ` variable, else this machine's zone. Call once at
+/// startup, before any thread is spawned (the system lookup is only
+/// reliable then).
+pub fn init(tz: Option<&str>) -> Result<(), String> {
+    let env = std::env::var("AXTAIL_TZ")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let zone = match (tz, env.as_deref()) {
+        (Some(v), _) => Zone {
+            offset: parse_offset(v)?,
+            name: None,
+            source: "--tz",
+        },
+        (None, Some(v)) => Zone {
+            offset: parse_offset(v).map_err(|e| format!("AXTAIL_TZ: {e}"))?,
+            name: None,
+            source: "AXTAIL_TZ",
+        },
+        (None, None) => Zone {
+            offset: UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC),
+            name: system_zone_name(),
+            source: "system",
+        },
+    };
+    let _ = ZONE.set(zone);
+    Ok(())
+}
+
+fn zone() -> &'static Zone {
+    ZONE.get_or_init(|| Zone {
+        offset: UtcOffset::UTC,
+        name: None,
+        source: "system",
+    })
 }
 
 fn offset() -> UtcOffset {
-    *OFFSET.get_or_init(|| UtcOffset::UTC)
+    zone().offset
 }
 
-/// "UTC+08:00" style label for the local zone.
-pub fn zone_label() -> String {
+/// Parses "UTC", "local", "+08:00", "+8", "-05:30", "UTC+8", "GMT-3".
+pub fn parse_offset(text: &str) -> Result<UtcOffset, String> {
+    let bad = || format!("invalid time zone '{text}' (use UTC, local, or an offset like +08:00)");
+    let t = text.trim();
+    let lower = t.to_ascii_lowercase();
+    if lower == "local" {
+        return Ok(UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC));
+    }
+    let rest = lower
+        .strip_prefix("utc")
+        .or_else(|| lower.strip_prefix("gmt"))
+        .unwrap_or(&lower);
+    if rest.is_empty() || rest == "z" {
+        return Ok(UtcOffset::UTC);
+    }
+    let (sign, digits) = match rest.as_bytes()[0] {
+        b'+' => (1i8, &rest[1..]),
+        b'-' => (-1i8, &rest[1..]),
+        _ => return Err(bad()),
+    };
+    let (h, m) = match digits.split_once(':') {
+        Some((h, m)) => (h, m),
+        None if digits.len() == 4 => digits.split_at(2),
+        None => (digits, "0"),
+    };
+    let h: i8 = h.parse().map_err(|_| bad())?;
+    let m: i8 = m.parse().map_err(|_| bad())?;
+    if !(0..=14).contains(&h) || !(0..60).contains(&m) {
+        return Err(bad());
+    }
+    UtcOffset::from_hms(sign * h, sign * m, 0).map_err(|_| bad())
+}
+
+/// Best-effort IANA zone name of this machine (Unix only).
+fn system_zone_name() -> Option<String> {
+    if let Ok(tz) = std::env::var("TZ") {
+        let tz = tz.trim_start_matches(':');
+        if tz.contains('/') && !tz.starts_with('/') {
+            return Some(tz.to_string());
+        }
+    }
+    if let Ok(target) = std::fs::read_link("/etc/localtime") {
+        let target = target.to_string_lossy();
+        if let Some((_, name)) = target.split_once("zoneinfo/") {
+            return Some(name.to_string());
+        }
+    }
+    std::fs::read_to_string("/etc/timezone")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// "UTC+08:00" style label for the zone in use.
+pub fn offset_label() -> String {
     let o = offset();
     if o.is_utc() {
         return "UTC".into();
@@ -26,6 +118,19 @@ pub fn zone_label() -> String {
     let (h, m, _) = o.as_hms();
     let sign = if o.is_negative() { '-' } else { '+' };
     format!("UTC{sign}{:02}:{:02}", h.unsigned_abs(), m.unsigned_abs())
+}
+
+/// "UTC+08:00 Asia/Kuala_Lumpur", or just the offset when no name is known.
+pub fn zone_label() -> String {
+    match &zone().name {
+        Some(n) if n != "UTC" && n != "Etc/UTC" => format!("{} {n}", offset_label()),
+        _ => offset_label(),
+    }
+}
+
+/// Where the zone came from, for the help screen.
+pub fn zone_source() -> &'static str {
+    zone().source
 }
 
 pub fn now_secs() -> i64 {
@@ -104,6 +209,21 @@ pub fn parse(text: &str, end: bool) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offsets() {
+        let hm = |s: &str| parse_offset(s).map(|o| (o.whole_hours(), o.minutes_past_hour()));
+        assert_eq!(hm("UTC"), Ok((0, 0)));
+        assert_eq!(hm("z"), Ok((0, 0)));
+        assert_eq!(hm("+08:00"), Ok((8, 0)));
+        assert_eq!(hm("+8"), Ok((8, 0)));
+        assert_eq!(hm("UTC+8"), Ok((8, 0)));
+        assert_eq!(hm("-05:30"), Ok((-5, -30)));
+        assert_eq!(hm("+0530"), Ok((5, 30)));
+        for bad in ["8", "+15", "+8:60", "Asia/Kuala_Lumpur", "utc+x"] {
+            assert!(parse_offset(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn round_trip_and_precision() {

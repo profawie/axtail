@@ -22,8 +22,11 @@ and Docker container logs, all in one coloured text interface.
   and `/regex/` refine it. The filter searches the whole log, not just what is on screen.
 - **File list with search and time range.** Type to search names, `Left`/`Right` to pick a
   time range (last 15 min ... 30 days), or `Tab` to type your own From / To date and time.
-- **Uncluttered screen.** The bottom line shows only the current state and a tip; the full
-  key list is one `Ctrl+G` away.
+- **Uncluttered screen.** The bottom line shows only the current state, a tip and the time
+  zone in use; the full key list is one `Ctrl+G` away.
+- **Time zone aware.** The machine's time zone is detected at start and shown at the bottom
+  right (for example `UTC+08:00 Asia/Kuala_Lumpur`). File times and the From / To range use it;
+  `--tz UTC` switches zone when the logs are written in another one.
 - **Multi-GB files.** Files are never loaded whole. axtail seeks from the end and reads
   only a small window around what is on screen.
 - **gzip and zip.** Archives are stream-decompressed in memory, never extracted to disk.
@@ -53,14 +56,36 @@ axtail app.log.gz                        # gzip, stream-decompressed
 axtail --docker myapp                    # live container logs
 axtail --docker myapp '/var/log/*.log'   # also list files inside the container
 axtail --docker myapp --grep 'panic'
+axtail --docker myapp --tz UTC           # dates in UTC, like most container logs
 ```
 
 | Option | Meaning |
 | --- | --- |
 | `--docker <CONTAINER>` | Read the container's logs with `docker logs`. With a filter, also list matching files inside the container. |
 | `--grep <PATTERN>` | A case-insensitive regex: shows the number of matching lines per file in the list and is applied as the viewer filter. |
+| `--tz <ZONE>` | Time zone for file times and the From / To range: `UTC`, `local`, or an offset such as `+08:00`, `-5`, `UTC+8`. Default: this machine's zone. |
 | `--tail <LINES>` | Lines kept in memory for Docker and compressed logs (default 10000, max 200000). |
 | `-h`, `--help` / `-V`, `--version` | Help / version. |
+
+## Time zone
+
+At start axtail reads the time zone of the machine it runs on and shows it in the bottom
+right corner, for example `◷ UTC+08:00 Asia/Kuala_Lumpur`. That zone is used for:
+
+- the `MODIFIED` column in the file list,
+- the `From` / `To` dates you type and the quick ranges (last 15 min ... 30 days).
+
+The zone is chosen in this order: `--tz <ZONE>`, then the `AXTAIL_TZ` environment variable,
+then the system zone (`TZ`, `/etc/localtime`). Servers and containers often run in UTC; if a
+log's timestamps are in another zone, start with `--tz` so your typed times line up with them:
+
+```sh
+axtail /var/log --tz UTC
+AXTAIL_TZ=+08:00 axtail /var/log
+```
+
+An invalid zone stops axtail with an error instead of silently using the wrong one.
+The `Ctrl+G` help shows the zone in use and how it was set.
 
 ## Keys
 

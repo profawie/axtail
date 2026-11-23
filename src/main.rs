@@ -32,6 +32,10 @@ OPTIONS:
     --grep <PATTERN>       Advanced search: a case-insensitive regex that is
                            applied as the viewer filter, with the number of
                            matching lines shown for every file in the list.
+    --tz <ZONE>            Time zone for dates shown and typed: UTC, local, or
+                           an offset such as +08:00 (default: this machine's
+                           zone; the AXTAIL_TZ variable works too). The zone
+                           in use is shown at the bottom right.
     --tail <LINES>         Lines kept in memory for docker/compressed logs
                            (default 10000, max 200000).
     -h, --help             Show this help.
@@ -47,6 +51,7 @@ EXAMPLES:
     axtail --docker myapp '/var/log/*.log'
     axtail --docker myapp '*.gz'           Archived logs anywhere in the usual folders
     axtail --docker myapp --grep 'panic'
+    axtail --docker myapp --tz UTC       Dates in UTC, like most container logs
 
 KEYS:
     File list   type to search names, Left/Right time range, Tab From/To dates,
@@ -54,6 +59,11 @@ KEYS:
     Log viewer  type to filter lines (error timeout, +must, -skip, \"phrase\",
                 /regex/), Up/Down scroll, Enter live/pause, Esc back
     Anywhere    Ctrl+G help, Ctrl+X exit
+
+TIME ZONE:
+    Dates in the file list and the From / To fields use this machine's time
+    zone, detected at start and shown at the bottom right. Use --tz UTC (or
+    --tz +08:00) when the logs' own timestamps are in another zone.
 ";
 
 struct Args {
@@ -61,6 +71,7 @@ struct Args {
     grep: Option<String>,
     ignore_case: bool,
     tail: usize,
+    tz: Option<String>,
     filters: Vec<String>,
 }
 
@@ -70,6 +81,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         grep: None,
         ignore_case: false,
         tail: 10_000,
+        tz: None,
         filters: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
@@ -86,6 +98,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--docker" => args.docker = Some(value("--docker")?),
             "--grep" => args.grep = Some(value("--grep")?),
             "-i" | "--ignore-case" => args.ignore_case = true,
+            "--tz" => args.tz = Some(value("--tz")?),
             "--tail" => {
                 let n: usize = value("--tail")?
                     .parse()
@@ -104,7 +117,6 @@ fn parse_args() -> Result<Option<Args>, String> {
 }
 
 fn main() -> ExitCode {
-    clock::init();
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -116,6 +128,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if let Err(e) = clock::init(args.tz.as_deref()) {
+        eprintln!("axtail: {e}");
+        return ExitCode::from(2);
+    }
     let grep = match &args.grep {
         None => None,
         Some(p) => match Filter::regex(p, &format!("/{p}/")) {
