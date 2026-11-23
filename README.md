@@ -5,21 +5,25 @@ It helps you find the root cause in log files over SSH: plain files, gzip, zip
 and Docker container logs, all in one coloured text interface.
 
 ```
- axtail 0.1.1 - /var/log/app
-┌ text ──────────────────────────────────── 260.4 MB / 521.8 MB (49%) ┐
-│2026-11-22T06:19:59Z ERROR [worker-15] request id=2999999 took 609ms │
-│2026-11-22 FATAL database connection pool exhausted                  │
-│2026-11-22T06:20:01Z INFO [worker-1] request id=3000001 took 611ms   │
-└─────────────────────────────────────────────────────────────────────┘
- LIVE  streaming in real time
-^F Search     ^P Older Match   ^N Newer Match   Enter Live/Pause  ^L File List
-Up/Dn Scroll  Lt/Rt Pan        Home/End Top/Bottom  ^G About      ^X Exit
+ axtail 0.1.2 - /var/log/app/api.log
+ Filter ▸ error timeout█                                         37 matching lines
+┌ text ─────────────────────────────────────── 260.4 MB / 521.8 MB (49%) ┐
+│2026-11-22T06:19:59Z ERROR [worker-15] upstream timeout after 30000ms   │
+│2026-11-22 FATAL database connection pool exhausted: timeout            │
+└────────────────────────────────────────────────────────────────────────┘
+ LIVE  only matching lines are shown  ·  Esc clears the filter    ^G Help  ^X Exit
 ```
 
 ## Features
 
 - **Live by default.** The viewer follows the log in real time (`LIVE` in the status line).
-- **Fast search.** `Ctrl+F` pauses streaming and searches the whole log, plain text or regex.
+- **Logcat-style filter.** Type in the viewer and only matching lines are shown, live or
+  paused: `error timeout` shows lines with either word; `+must`, `-skip`, `"exact phrase"`
+  and `/regex/` refine it. The filter searches the whole log, not just what is on screen.
+- **File list with search and time range.** Type to search names, `Left`/`Right` to pick a
+  time range (last 15 min ... 30 days), or `Tab` to type your own From / To date and time.
+- **Uncluttered screen.** The bottom line shows only the current state and a tip; the full
+  key list is one `Ctrl+G` away.
 - **Multi-GB files.** Files are never loaded whole. axtail seeks from the end and reads
   only a small window around what is on screen.
 - **gzip and zip.** Archives are stream-decompressed in memory, never extracted to disk.
@@ -54,40 +58,54 @@ axtail --docker myapp --grep 'panic'
 | Option | Meaning |
 | --- | --- |
 | `--docker <CONTAINER>` | Read the container's logs with `docker logs`. With a filter, also list matching files inside the container. |
-| `--grep <PATTERN>` | Start with a regex search active and show the number of matching lines per file in the list. |
-| `-i`, `--ignore-case` | Make `--grep` case-insensitive. |
+| `--grep <PATTERN>` | A case-insensitive regex: shows the number of matching lines per file in the list and is applied as the viewer filter. |
 | `--tail <LINES>` | Lines kept in memory for Docker and compressed logs (default 10000, max 200000). |
 | `-h`, `--help` / `-V`, `--version` | Help / version. |
 
 ## Keys
 
-All available keys are always shown at the bottom of the screen.
+The bottom line shows a tip for the current screen. `Ctrl+G` (or `F1`) opens the full key
+list and About; any key closes it. `Ctrl+X` exits.
 
 **File list**
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Select a log |
+| type | Search names (every word must appear), applied as you type |
+| `Left` / `Right` | Time range: all time, last 15 min, 1 h, 6 h, 24 h, 3 days, 7 days, 30 days |
+| `Tab` / `Shift+Tab` | Move to the From / To fields and type a date: `2026-11-22`, `2026-11-22 13`, `2026-11-22 13:05` |
+| `Up` / `Down`, `PageUp` / `PageDown` | Select a log |
 | `Enter` | Open the selected log |
-| `Left` / `Right` | Change sort order (name, newest, largest, matches) |
-| `Ctrl+F` | Filter the list by name |
-| `Ctrl+G` | About |
-| `Ctrl+X` | Exit |
+| `Ctrl+S` | Sort: newest, name, largest (and matches with `--grep`) |
+| `Ctrl+U` / `Ctrl+W` | Clear the field / delete the last word |
+| `Esc` | Leave the date field, then clear the search, then the time range |
+
+The time range uses each file's modification time in the local time zone (shown at the
+right of the bar). A log modified just after "To" can still hold lines from inside the
+range, so for each folder the first file modified after "To" is listed too.
 
 **Log viewer**
 
 | Key | Action |
 | --- | --- |
+| type | Filter lines, applied when you pause typing |
 | `Up` / `Down`, `PageUp` / `PageDown` | Scroll (pauses live) |
-| `Left` / `Right` | Pan long lines |
+| `Enter` | Pause / resume live |
 | `Home` / `End` | Jump to the start / back to the end (live) |
-| `Enter` | Toggle live / paused |
-| `Ctrl+F` | Search (pauses live). `Tab` in the prompt switches text / case-sensitive / regex |
-| `Ctrl+P` / `Ctrl+N` | Older / newer match |
-| `Esc` | Cancel a running search, clear the search, or go back to the list |
+| `Left` / `Right` | Pan long lines |
+| `Ctrl+U` / `Ctrl+W` | Clear the filter / delete its last word |
+| `Esc` | Cancel a running scan, clear the filter, or go back to the list |
 | `Ctrl+L` | Back to the file list |
-| `Ctrl+G` | About |
-| `Ctrl+X` | Exit |
+
+Filter syntax (always case-insensitive):
+
+| Query | Shows lines that |
+| --- | --- |
+| `error timeout` | contain `error` **or** `timeout` |
+| `error +db` | contain `error` and also `db` |
+| `error -healthcheck` | contain `error` but not `healthcheck` |
+| `"connection reset"` | contain the exact phrase |
+| `/time(d)? ?out \d+ms/` | match a regular expression (whole query between slashes) |
 
 ## Build and run
 
@@ -193,8 +211,15 @@ Run the tests with `cargo test`.
 - **gzip / zip / Docker** cannot be seeked, so they are streamed through a fixed-size
   ring buffer. Jumping far back re-streams from the start, which costs CPU time but no
   extra memory or disk.
-- **Search** scans in 1 MB chunks on a background thread, shows progress and can be
-  cancelled with `Esc`. The interface stays responsive.
+- **The filter** runs on a background thread in 1 MB chunks: backwards from the end of a
+  plain file until it has the latest `--tail` matching lines, or through the stream for
+  compressed and Docker logs. It shows progress and `Esc` cancels it. Only matching lines
+  are kept, and live updates read only the new bytes, so a filtered live view of a busy
+  log costs little. On this project's test machine a 522 MB file took about 0.13 s when
+  cached; a cold disk runs at disk speed.
+- **Live Docker with a filter** filters on the follower thread, so only matching lines
+  reach the screen. It starts from the last `--tail` lines; scroll up to scan the full
+  `docker logs` history.
 - **Live Docker output** flows through a bounded channel, so a very chatty container is
   slowed down by backpressure instead of filling memory.
 - **Idle cost.** The screen is only redrawn when something changes.
@@ -218,8 +243,8 @@ Run the tests with `cargo test`.
   | `'/opt/app/logs/*.zip'` | files with that name under one folder, recursively |
   | `/opt/app/logs` | every file under that folder (or that one file) |
 
-- In the list, `Left`/`Right` switches between newest first and by name (grouped by
-  folder, with numbers in natural order), and `Ctrl+F` filters by name, for example `11-21`.
+- In the list, `Ctrl+S` switches between newest first and by name (grouped by
+  folder, with numbers in natural order), and typing searches names, for example `11-21`.
 - The scan is one `docker exec NAME sh -c "find ... | head"` call: read-only, at most
   20,000 files, and only file names, sizes and dates are read. A log's content is read
   only when you open it, with `cat` or `tail -F`. The image needs `sh` and `find`

@@ -1,8 +1,8 @@
 //! Application state and event loop.
 //!
 //! The UI thread never does unbounded work: anything that may need to read
-//! a lot of data (stream windows, searches, match counts) runs on a worker
-//! thread that can be cancelled and reports progress.
+//! a lot of data (filtered windows, stream windows, match counts) runs on a
+//! worker thread that can be cancelled and reports progress.
 
 use std::io;
 use std::sync::Arc;
@@ -14,14 +14,17 @@ use std::time::{Duration, Instant};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::search::{self, Dir, Matcher, Mode};
-use crate::source::{Killer, Scan, Source};
+use crate::clock;
+use crate::filter::{self, Filter};
+use crate::source::{Killer, Scan, Source, natural_cmp};
 use crate::ui;
 use crate::window::{self, Appended, Line, LineReader, Target, Window};
 
+/// How long typing must pause before the viewer filter is applied.
+const TYPE_DELAY: Duration = Duration::from_millis(250);
+
 pub struct Job {
     pub id: u64,
-    pub label: &'static str,
     pub cancel: Arc<AtomicBool>,
     pub progress: Arc<AtomicU64>,
 }
@@ -34,18 +37,22 @@ impl Drop for Job {
 
 enum Msg {
     Window(u64, io::Result<Window>),
-    Found(u64, Dir, io::Result<Option<u64>>),
     Count(usize, io::Result<u64>),
 }
 
-/// Background reader for a live docker stream. Bounded channel = backpressure.
+/// Background reader for a live docker stream. Lines are filtered on that
+/// thread; a bounded channel gives backpressure.
 struct Follower {
     rx: Receiver<Vec<Line>>,
     killer: Killer,
 }
 
 impl Follower {
-    fn spawn(reader: Box<dyn io::Read + Send>, killer: Killer) -> Follower {
+    fn spawn(
+        reader: Box<dyn io::Read + Send>,
+        killer: Killer,
+        filter: Option<Arc<Filter>>,
+    ) -> Follower {
         let (tx, rx): (SyncSender<Vec<Line>>, _) = mpsc::sync_channel(32);
         thread::spawn(move || {
             let mut lr = LineReader::new(reader, 0);
@@ -54,11 +61,14 @@ impl Follower {
             loop {
                 match lr.next_line(&mut buf) {
                     Ok(Some((off, _))) => {
-                        batch.push(Line {
-                            off,
-                            data: buf.as_slice().into(),
-                        });
+                        if filter.as_ref().is_none_or(|f| f.is_match(&buf)) {
+                            batch.push(Line {
+                                off,
+                                data: buf.as_slice().into(),
+                            });
+                        }
                         if (lr.drained() || batch.len() >= 64)
+                            && !batch.is_empty()
                             && tx.send(std::mem::take(&mut batch)).is_err()
                         {
                             return;
@@ -87,7 +97,6 @@ enum After {
     Top,
     Anchor { off: u64, delta: isize },
     AnchorContent { data: Box<[u8]>, delta: isize },
-    Match(u64),
 }
 
 pub struct Viewer {
@@ -98,10 +107,12 @@ pub struct Viewer {
     pub live: bool,
     follower: Option<Follower>,
     pub loading: Option<Job>,
-    pub searching: Option<Job>,
     after: After,
-    pub matcher: Option<Arc<Matcher>>,
-    pub cur_match: Option<u64>,
+    /// The filter in effect and the text being typed (applied after a pause).
+    pub filter: Option<Arc<Filter>>,
+    pub query: String,
+    query_changed: Option<Instant>,
+    pub query_error: Option<String>,
     pub notice: String,
     last_poll: Instant,
 }
@@ -112,22 +123,18 @@ pub enum Screen {
     Viewer,
 }
 
+/// Which field of the file list's top bar receives typing.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PromptKind {
+pub enum Focus {
     Search,
-    ListFilter,
-}
-
-pub struct Prompt {
-    pub kind: PromptKind,
-    pub text: String,
-    pub mode: Mode,
+    From,
+    To,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
-    Name,
     Newest,
+    Name,
     Largest,
     Matches,
 }
@@ -143,6 +150,18 @@ impl Sort {
     }
 }
 
+/// Time range presets cycled with Left/Right: (label, seconds back; 0 = all).
+pub const PRESETS: &[(&str, i64)] = &[
+    ("All time", 0),
+    ("Last 15 min", 15 * 60),
+    ("Last 1 hour", 3600),
+    ("Last 6 hours", 6 * 3600),
+    ("Last 24 hours", 24 * 3600),
+    ("Last 3 days", 3 * 86400),
+    ("Last 7 days", 7 * 86400),
+    ("Last 30 days", 30 * 86400),
+];
+
 #[derive(Clone, Copy)]
 pub enum Count {
     Pending,
@@ -156,18 +175,22 @@ pub struct App {
     pub order: Vec<usize>,
     pub sel: usize,
     pub sort: Sort,
-    pub name_filter: String,
     pub counts: Vec<Count>,
-    pub grep: Option<Arc<Matcher>>,
+    pub grep: Option<Arc<Filter>>,
     pub screen: Screen,
     pub viewer: Option<Viewer>,
-    pub about: bool,
-    pub prompt: Option<Prompt>,
+    pub help: bool,
+    // File list filters.
+    pub search: String,
+    pub focus: Focus,
+    /// Index into PRESETS, or None for a custom range typed by hand.
+    pub preset: Option<usize>,
+    pub from_text: String,
+    pub to_text: String,
+    pub range_error: bool,
     pub message: String,
     pub rows: usize,
     tail: usize,
-    last_mode: Mode,
-    last_query: String,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     next_id: u64,
@@ -186,32 +209,59 @@ fn ctrl(key: &KeyEvent, c: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
 }
 
+fn typed(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+/// Removes the last word (and the spaces after it), like Ctrl+W in a shell.
+fn delete_word(s: &mut String) {
+    let trimmed = s.trim_end().len();
+    s.truncate(trimmed);
+    let cut = s.rfind(' ').map_or(0, |i| i + 1);
+    s.truncate(cut);
+}
+
 fn err_text(e: &io::Error) -> String {
     e.to_string()
 }
 
 impl App {
-    pub fn new(scan: Scan, grep: Option<Matcher>, tail: usize) -> App {
+    pub fn new(scan: Scan, grep: Option<Filter>, tail: usize) -> App {
         let (tx, rx) = mpsc::channel();
         let grep = grep.map(Arc::new);
         let docker = scan.sources.iter().any(|s| s.is_docker());
+        let has_times = scan.sources.iter().any(|s| s.modified.is_some());
         let mut app = App {
             title: scan.title,
             counts: vec![Count::Pending; scan.sources.len()],
             order: Vec::new(),
             sources: scan.sources,
             sel: 0,
-            // In a container there are often hundreds of rotated files:
-            // show the most recent first.
-            sort: if docker { Sort::Newest } else { Sort::Name },
-            name_filter: String::new(),
-            last_mode: grep.as_ref().map_or(Mode::Text, |m| m.mode),
-            last_query: grep.as_ref().map_or(String::new(), |m| m.query.clone()),
+            // Rotated logs are easiest to browse newest first.
+            sort: if docker || has_times {
+                Sort::Newest
+            } else {
+                Sort::Name
+            },
             grep,
             screen: Screen::List,
             viewer: None,
-            about: false,
-            prompt: None,
+            help: false,
+            search: String::new(),
+            focus: Focus::Search,
+            preset: Some(0),
+            from_text: String::new(),
+            to_text: String::new(),
+            range_error: false,
             message: match scan.warnings.len() {
                 0 => String::new(),
                 1 => scan.warnings[0].clone(),
@@ -246,7 +296,7 @@ impl App {
             for (i, src) in jobs {
                 if cancel.load(Ordering::Relaxed)
                     || tx
-                        .send(Msg::Count(i, search::count(&src, &m, &cancel)))
+                        .send(Msg::Count(i, filter::count(&src, &m, &cancel)))
                         .is_err()
                 {
                     return;
@@ -255,17 +305,60 @@ impl App {
         });
     }
 
+    // ----- file list -------------------------------------------------------
+
+    /// The active time range as (from, to) in seconds; None = open end.
+    pub fn range(&self) -> (Option<i64>, Option<i64>) {
+        match self.preset {
+            Some(0) => (None, None),
+            Some(i) => (Some(clock::now_secs() - PRESETS[i].1), None),
+            None => (
+                clock::parse(&self.from_text, false),
+                clock::parse(&self.to_text, true),
+            ),
+        }
+    }
+
     fn rebuild_order(&mut self) {
-        let needle = self.name_filter.to_lowercase();
-        let mut order: Vec<usize> = (0..self.sources.len())
-            .filter(|&i| needle.is_empty() || self.sources[i].name.to_lowercase().contains(&needle))
+        let terms: Vec<String> = self
+            .search
+            .split_whitespace()
+            .map(|t| t.to_lowercase())
             .collect();
+        let (from, to) = self.range();
+        self.range_error = self.preset.is_none()
+            && ((!self.from_text.trim().is_empty() && from.is_none())
+                || (!self.to_text.trim().is_empty() && to.is_none()));
+        let ranged = from.is_some() || to.is_some();
         let s = &self.sources;
-        match self.sort {
-            // Natural order on the full path keeps each folder together.
-            Sort::Name => {
-                order.sort_by(|&a, &b| crate::source::natural_cmp(&s[a].name, &s[b].name))
+        let name_ok = |i: usize| {
+            let name = s[i].name.to_lowercase();
+            terms.iter().all(|t| name.contains(t.as_str()))
+        };
+        let time = |i: usize| s[i].modified.map(clock::secs);
+        let in_range = |t: i64| from.is_none_or(|f| t >= f) && to.is_none_or(|e| t <= e);
+        let mut order: Vec<usize> = (0..s.len())
+            .filter(|&i| name_ok(i))
+            .filter(|&i| s[i].is_docker_logs() || !ranged || time(i).is_some_and(in_range))
+            .collect();
+        // A log written after the range's end may still hold its last lines:
+        // per folder, also keep the first file modified after "To".
+        if let Some(end) = to {
+            let mut next: std::collections::HashMap<&str, (i64, usize)> = Default::default();
+            for i in (0..s.len()).filter(|&i| name_ok(i)) {
+                let Some(t) = time(i).filter(|&t| t > end && from.is_none_or(|f| t >= f)) else {
+                    continue;
+                };
+                let dir = s[i].name.rfind(['/', '\\']).map_or("", |p| &s[i].name[..p]);
+                let e = next.entry(dir).or_insert((t, i));
+                if t < e.0 {
+                    *e = (t, i);
+                }
             }
+            order.extend(next.values().map(|&(_, i)| i));
+        }
+        match self.sort {
+            Sort::Name => order.sort_by(|&a, &b| natural_cmp(&s[a].name, &s[b].name)),
             Sort::Newest => order.sort_by(|&a, &b| s[b].modified.cmp(&s[a].modified)),
             Sort::Largest => order.sort_by(|&a, &b| s[b].size.cmp(&s[a].size)),
             Sort::Matches => {
@@ -277,16 +370,131 @@ impl App {
             }
         }
         // The live `docker logs` stream always stays at the top.
-        order.sort_by_key(|&i| !self.sources[i].is_docker_logs());
+        order.sort_by_key(|&i| !s[i].is_docker_logs());
         self.order = order;
         self.sel = self.sel.min(self.order.len().saturating_sub(1));
     }
 
-    fn new_job(&mut self, label: &'static str) -> Job {
+    fn set_preset(&mut self, i: usize) {
+        self.preset = Some(i);
+        self.focus = Focus::Search;
+        if i == 0 {
+            self.from_text.clear();
+        } else {
+            self.from_text = clock::format(clock::now_secs() - PRESETS[i].1);
+        }
+        self.to_text.clear();
+        self.rebuild_order();
+    }
+
+    fn on_list_key(&mut self, key: KeyEvent) {
+        self.message.clear();
+        let last = self.order.len().saturating_sub(1);
+        let page = self.rows.saturating_sub(2).max(1);
+        if let Some(c) = typed(&key) {
+            match self.focus {
+                Focus::Search => self.search.push(c),
+                Focus::From | Focus::To => {
+                    if c.is_ascii_digit() || matches!(c, '-' | ':' | ' ' | 'T') {
+                        self.preset = None;
+                        let field = if self.focus == Focus::From {
+                            &mut self.from_text
+                        } else {
+                            &mut self.to_text
+                        };
+                        if field.len() < 19 {
+                            field.push(c);
+                        }
+                    }
+                }
+            }
+            self.sel = 0;
+            return self.rebuild_order();
+        }
+        let field = match self.focus {
+            Focus::Search => &mut self.search,
+            Focus::From => &mut self.from_text,
+            Focus::To => &mut self.to_text,
+        };
+        let date_field = self.focus != Focus::Search;
+        match key.code {
+            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
+            KeyCode::Down => self.sel = (self.sel + 1).min(last),
+            KeyCode::PageUp => self.sel = self.sel.saturating_sub(page),
+            KeyCode::PageDown => self.sel = (self.sel + page).min(last),
+            KeyCode::Home => self.sel = 0,
+            KeyCode::End => self.sel = last,
+            KeyCode::Enter => {
+                if let Some(&i) = self.order.get(self.sel) {
+                    self.open(i);
+                }
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let n = PRESETS.len();
+                let cur = self.preset.unwrap_or(0);
+                let next = if key.code == KeyCode::Right {
+                    (cur + 1) % n
+                } else {
+                    (cur + n - 1) % n
+                };
+                self.set_preset(next);
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let order = [Focus::Search, Focus::From, Focus::To];
+                let i = order.iter().position(|&f| f == self.focus).unwrap_or(0);
+                let step = if key.code == KeyCode::Tab { 1 } else { 2 };
+                self.focus = order[(i + step) % 3];
+                // Start a custom range from what the preset showed.
+                if self.focus != Focus::Search && self.preset.is_some_and(|p| p > 0) {
+                    self.preset = None;
+                }
+            }
+            KeyCode::Backspace => {
+                field.pop();
+                if date_field {
+                    self.preset = None;
+                }
+                self.rebuild_order();
+            }
+            KeyCode::Char('u') if ctrl(&key, 'u') => {
+                field.clear();
+                if date_field {
+                    self.preset = None;
+                }
+                self.rebuild_order();
+            }
+            KeyCode::Char('w') if ctrl(&key, 'w') => {
+                delete_word(field);
+                self.rebuild_order();
+            }
+            KeyCode::Char('s') if ctrl(&key, 's') => {
+                let all: &[Sort] = if self.grep.is_some() {
+                    &[Sort::Newest, Sort::Name, Sort::Largest, Sort::Matches]
+                } else {
+                    &[Sort::Newest, Sort::Name, Sort::Largest]
+                };
+                let i = all.iter().position(|&s| s == self.sort).unwrap_or(0);
+                self.sort = all[(i + 1) % all.len()];
+                self.rebuild_order();
+            }
+            KeyCode::Esc => {
+                if date_field {
+                    self.focus = Focus::Search;
+                } else if !self.search.is_empty() {
+                    self.search.clear();
+                    self.rebuild_order();
+                } else if self.preset != Some(0) {
+                    self.set_preset(0);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn new_job(&mut self) -> Job {
         self.next_id += 1;
         Job {
             id: self.next_id,
-            label,
             cancel: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(AtomicU64::new(0)),
         }
@@ -304,23 +512,25 @@ impl App {
                 terminal.draw(|f| ui::draw(f, self))?;
                 dirty = false;
             }
-            let busy = self
+            let typing = self
                 .viewer
                 .as_ref()
-                .is_some_and(|v| v.loading.is_some() || v.searching.is_some());
+                .is_some_and(|v| v.query_changed.is_some());
+            let busy = self.viewer.as_ref().is_some_and(|v| v.loading.is_some());
             let timeout = Duration::from_millis(if self.backlog {
                 0
-            } else if busy {
+            } else if busy || typing {
                 50
             } else {
                 200
             });
             if event::poll(timeout)? {
-                // Drain a burst of input (key repeat) before redrawing once.
-                for _ in 0..64 {
+                // Drain a burst of input (key repeat, paste) before redrawing once.
+                for _ in 0..256 {
                     match event::read()? {
                         Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
-                        _ => {}
+                        Event::Resize(..) => {}
+                        _ => continue,
                     }
                     if self.quit || !event::poll(Duration::ZERO)? {
                         break;
@@ -328,6 +538,7 @@ impl App {
                 }
                 dirty = true;
             }
+            dirty |= self.apply_typed_query();
             dirty |= self.drain_messages();
             dirty |= self.tick();
             dirty |= busy;
@@ -342,15 +553,12 @@ impl App {
             self.quit = true;
             return;
         }
-        if self.about {
-            self.about = false;
+        if self.help {
+            self.help = false;
             return;
         }
-        if self.prompt.is_some() {
-            return self.on_prompt_key(key);
-        }
         if ctrl(&key, 'g') || key.code == KeyCode::F(1) {
-            self.about = true;
+            self.help = true;
             return;
         }
         match self.screen {
@@ -359,129 +567,34 @@ impl App {
         }
     }
 
-    fn on_prompt_key(&mut self, key: KeyEvent) {
-        let Some(p) = &mut self.prompt else { return };
-        let kind = p.kind;
-        match key.code {
-            KeyCode::Esc => self.prompt = None,
-            KeyCode::Tab if kind == PromptKind::Search => p.mode = p.mode.next(),
-            KeyCode::Backspace => {
-                p.text.pop();
-            }
-            KeyCode::Char(c)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                if p.text.len() < 512 {
-                    p.text.push(c);
-                }
-            }
-            KeyCode::Enter => {
-                let p = self.prompt.take().unwrap();
-                match kind {
-                    PromptKind::ListFilter => {}
-                    PromptKind::Search => return self.submit_search(p),
-                }
-            }
-            _ => {}
-        }
-        if kind == PromptKind::ListFilter {
-            if let Some(p) = &self.prompt {
-                self.name_filter = p.text.clone();
-            } else if key.code == KeyCode::Esc {
-                self.name_filter.clear();
-            }
-            self.rebuild_order();
-        }
-    }
-
-    fn submit_search(&mut self, p: Prompt) {
-        self.last_mode = p.mode;
-        self.last_query = p.text.clone();
-        let Some(v) = &mut self.viewer else { return };
-        v.cur_match = None;
-        if p.text.is_empty() {
-            v.matcher = None;
-            v.notice = "Search cleared".into();
-            return;
-        }
-        match Matcher::new(&p.text, p.mode) {
-            Ok(m) => {
-                v.matcher = Some(Arc::new(m));
-                self.start_search(Dir::Back);
-            }
-            Err(e) => {
-                v.notice = format!("Invalid pattern: {e}");
-                self.prompt = Some(p);
-            }
-        }
-    }
-
-    fn on_list_key(&mut self, key: KeyEvent) {
-        let last = self.order.len().saturating_sub(1);
-        let page = self.rows.saturating_sub(1).max(1);
-        match key.code {
-            KeyCode::Up => self.sel = self.sel.saturating_sub(1),
-            KeyCode::Down => self.sel = (self.sel + 1).min(last),
-            KeyCode::PageUp => self.sel = self.sel.saturating_sub(page),
-            KeyCode::PageDown => self.sel = (self.sel + page).min(last),
-            KeyCode::Home => self.sel = 0,
-            KeyCode::End => self.sel = last,
-            KeyCode::Left | KeyCode::Right => {
-                let all: &[Sort] = if self.grep.is_some() {
-                    &[Sort::Name, Sort::Newest, Sort::Largest, Sort::Matches]
-                } else {
-                    &[Sort::Name, Sort::Newest, Sort::Largest]
-                };
-                let i = all.iter().position(|&s| s == self.sort).unwrap_or(0);
-                let step = if key.code == KeyCode::Right {
-                    1
-                } else {
-                    all.len() - 1
-                };
-                self.sort = all[(i + step) % all.len()];
-                self.rebuild_order();
-            }
-            KeyCode::Enter => {
-                if let Some(&i) = self.order.get(self.sel) {
-                    self.open(i);
-                }
-            }
-            KeyCode::Esc if !self.name_filter.is_empty() => {
-                self.name_filter.clear();
-                self.rebuild_order();
-            }
-            KeyCode::Char('/') => self.open_filter_prompt(),
-            KeyCode::Char('f') if ctrl(&key, 'f') => self.open_filter_prompt(),
-            _ => {}
-        }
-    }
-
-    fn open_filter_prompt(&mut self) {
-        self.prompt = Some(Prompt {
-            kind: PromptKind::ListFilter,
-            text: self.name_filter.clone(),
-            mode: Mode::Text,
-        });
-    }
-
     fn on_viewer_key(&mut self, key: KeyEvent) {
         let page = self.rows.saturating_sub(1).max(1) as isize;
         let Some(v) = &mut self.viewer else { return };
+        if let Some(c) = typed(&key) {
+            if v.query.len() < 512 {
+                v.query.push(c);
+                v.query_changed = Some(Instant::now());
+            }
+            return;
+        }
         v.notice.clear();
         match key.code {
-            KeyCode::Char('f') if ctrl(&key, 'f') => self.open_search_prompt(),
-            KeyCode::Char('/') => self.open_search_prompt(),
-            KeyCode::Char('l') if ctrl(&key, 'l') => self.back_to_list(),
-            KeyCode::Char('p') if ctrl(&key, 'p') => self.start_search(Dir::Back),
-            KeyCode::Char('n') if ctrl(&key, 'n') => self.start_search(Dir::Fwd),
-            KeyCode::Char('N') => self.start_search(Dir::Back),
-            KeyCode::Char('n') => self.start_search(Dir::Fwd),
-            KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.start_search(Dir::Back)
+            KeyCode::Backspace => {
+                v.query.pop();
+                v.query_changed = Some(Instant::now());
             }
-            KeyCode::F(3) => self.start_search(Dir::Fwd),
+            KeyCode::Char('u') if ctrl(&key, 'u') => {
+                v.query.clear();
+                v.query_changed = Some(Instant::now());
+            }
+            KeyCode::Char('w') if ctrl(&key, 'w') => {
+                delete_word(&mut v.query);
+                v.query_changed = Some(Instant::now());
+            }
+            KeyCode::Char('f') if ctrl(&key, 'f') => {
+                v.notice = "Just type: the filter is at the top. Example: error timeout".into();
+            }
+            KeyCode::Char('l') if ctrl(&key, 'l') => self.back_to_list(),
             KeyCode::Up => self.scroll(-1),
             KeyCode::Down => self.scroll(1),
             KeyCode::PageUp => self.scroll(-page),
@@ -504,14 +617,18 @@ impl App {
                 self.set_live(on);
             }
             KeyCode::Esc => {
-                if v.loading.is_some() || v.searching.is_some() {
+                if v.loading.is_some() {
                     v.loading = None;
-                    v.searching = None;
                     v.notice = "Cancelled".into();
-                } else if v.matcher.is_some() {
-                    v.matcher = None;
-                    v.cur_match = None;
-                    v.notice = "Search cleared".into();
+                    if v.win.lines.is_empty() && v.filter.is_some() {
+                        // A filter was being applied: drop it and go back.
+                        v.query.clear();
+                        v.filter = None;
+                        self.refresh_view();
+                    }
+                } else if !v.query.is_empty() || v.filter.is_some() {
+                    v.query.clear();
+                    v.query_changed = Some(Instant::now() - TYPE_DELAY);
                 } else {
                     self.back_to_list();
                 }
@@ -525,14 +642,57 @@ impl App {
         self.screen = Screen::List;
     }
 
-    fn open_search_prompt(&mut self) {
-        // Searching freezes the view so new lines do not disturb it.
-        self.set_live(false);
-        self.prompt = Some(Prompt {
-            kind: PromptKind::Search,
-            text: self.last_query.clone(),
-            mode: self.last_mode,
-        });
+    /// Applies the typed filter once typing has paused.
+    fn apply_typed_query(&mut self) -> bool {
+        let Some(v) = &mut self.viewer else {
+            return false;
+        };
+        match v.query_changed {
+            Some(t) if t.elapsed() >= TYPE_DELAY => v.query_changed = None,
+            _ => return false,
+        }
+        let parsed = match Filter::parse(&v.query) {
+            Ok(f) => f,
+            Err(e) => {
+                v.query_error = Some(e);
+                return true;
+            }
+        };
+        v.query_error = None;
+        let same = match (&parsed, &v.filter) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.text.trim() == b.text.trim(),
+            _ => false,
+        };
+        if same {
+            return true;
+        }
+        v.filter = parsed.map(Arc::new);
+        self.refresh_view();
+        // Never show the old lines under the new filter while it is applied.
+        if let Some(v) = &mut self.viewer
+            && v.loading.is_some()
+        {
+            v.win = Window::default();
+        }
+        true
+    }
+
+    /// Reloads the view after the filter changed, keeping the position.
+    fn refresh_view(&mut self) {
+        let Some(v) = &mut self.viewer else { return };
+        if v.live {
+            return self.set_live(true);
+        }
+        let target = v.win.lines.get(v.top).map(|l| (l.off, l.data.clone()));
+        match target {
+            Some((_, data)) if v.win.relative => {
+                self.start_load(Target::End, After::AnchorContent { data, delta: 0 })
+            }
+            Some((off, _)) => self.start_load(Target::Around(off), After::Anchor { off, delta: 0 }),
+            None if v.win.at_start && !v.win.at_end => self.start_load(Target::Start, After::Top),
+            None => self.start_load(Target::End, After::Bottom),
+        }
     }
 
     // ----- viewer ----------------------------------------------------------
@@ -540,6 +700,8 @@ impl App {
     fn open(&mut self, idx: usize) {
         let src = self.sources[idx].clone();
         let can_live = src.can_live();
+        let filter = self.grep.clone();
+        let query = filter.as_ref().map_or(String::new(), |f| f.text.clone());
         self.viewer = Some(Viewer {
             src,
             win: Window::default(),
@@ -548,10 +710,11 @@ impl App {
             live: false,
             follower: None,
             loading: None,
-            searching: None,
             after: After::Bottom,
-            matcher: self.grep.clone(),
-            cur_match: None,
+            filter,
+            query,
+            query_changed: None,
+            query_error: None,
             notice: String::new(),
             last_poll: Instant::now(),
         });
@@ -576,9 +739,13 @@ impl App {
             return;
         }
         v.loading = None;
-        v.searching = None;
-        v.cur_match = None;
+        v.follower = None;
         if let Some(path) = v.src.plain_path() {
+            if v.filter.is_some() {
+                // Finding the latest matches may read far back: worker.
+                v.live = true;
+                return self.start_load(Target::End, After::Bottom);
+            }
             match window::load_plain(path, Target::End) {
                 Ok(w) => {
                     v.win = w;
@@ -596,7 +763,7 @@ impl App {
                         ..Default::default()
                     };
                     v.top = 0;
-                    v.follower = Some(Follower::spawn(reader, killer));
+                    v.follower = Some(Follower::spawn(reader, killer, v.filter.clone()));
                     v.live = true;
                 }
                 Err(e) => v.notice = err_text(&e),
@@ -606,11 +773,10 @@ impl App {
 
     fn start_load(&mut self, target: Target, after: After) {
         let tail = self.tail;
-        let Some(src) = self.viewer.as_ref().map(|v| v.src.clone()) else {
-            return;
-        };
-        if let Some(path) = src.plain_path() {
-            // Seekable: a bounded read around the target, done inline.
+        let Some(v) = &self.viewer else { return };
+        let (src, filter) = (v.src.clone(), v.filter.clone());
+        if let (Some(path), None) = (src.plain_path(), &filter) {
+            // Seekable and unfiltered: a bounded read around the target, inline.
             match window::load_plain(path, target) {
                 Ok(w) => {
                     let v = self.viewer.as_mut().unwrap();
@@ -622,7 +788,7 @@ impl App {
             }
             return;
         }
-        let job = self.new_job("Loading");
+        let job = self.new_job();
         let (id, cancel, progress, tx) = (
             job.id,
             job.cancel.clone(),
@@ -630,9 +796,14 @@ impl App {
             self.tx.clone(),
         );
         thread::spawn(move || {
-            let res = src
-                .open_stream()
-                .and_then(|r| window::load_stream(r, target, tail, &cancel, &progress));
+            let res = match (src.plain_path(), filter.as_deref()) {
+                (Some(path), Some(f)) => {
+                    window::load_plain_filtered(path, target, tail, f, &cancel, &progress)
+                }
+                _ => src.open_stream().and_then(|r| {
+                    window::load_stream(r, target, tail, &cancel, &progress, filter.as_deref())
+                }),
+            };
             let _ = tx.send(Msg::Window(id, res));
         });
         let v = self.viewer.as_mut().unwrap();
@@ -660,10 +831,6 @@ impl App {
                     .unwrap_or(max_top as usize);
                 v.top = place(idx, delta);
             }
-            After::Match(off) => {
-                v.cur_match = Some(off);
-                v.top = place(v.win.index_of(off), -((rows / 3) as isize));
-            }
         }
     }
 
@@ -686,55 +853,13 @@ impl App {
         };
         if v.win.relative {
             // A live docker window has no absolute position yet: reload the
-            // tail with real offsets and re-anchor on the same line.
+            // full log with real offsets and re-anchor on the same line.
             let data = top_line.data.clone();
             self.start_load(Target::End, After::AnchorContent { data, delta });
         } else {
             let off = top_line.off;
             self.start_load(Target::Around(off), After::Anchor { off, delta });
         }
-    }
-
-    fn start_search(&mut self, dir: Dir) {
-        let rows = self.rows;
-        let Some(v) = &mut self.viewer else { return };
-        let Some(m) = v.matcher.clone() else {
-            v.notice = "No search pattern yet: press ^F".into();
-            return;
-        };
-        if v.live {
-            self.set_live(false);
-        }
-        let job = self.new_job("Searching");
-        let v = self.viewer.as_mut().unwrap();
-        let w = &v.win;
-        // Continue from the current match only while it is still on screen;
-        // after scrolling away, search from what the user is looking at.
-        let visible = |off: u64| w.lines.iter().skip(v.top).take(rows).any(|l| l.off == off);
-        let pos = match (dir, v.cur_match.filter(|&c| visible(c))) {
-            (Dir::Back, Some(c)) => c,
-            (Dir::Fwd, Some(c)) => c + 1,
-            (_, None) if w.relative => u64::MAX,
-            (Dir::Back, None) => match w.lines.get(v.top + rows) {
-                Some(l) => l.off,
-                None if w.at_end => u64::MAX,
-                None => w.lines.back().map_or(u64::MAX, |l| l.off + 1),
-            },
-            (Dir::Fwd, None) => w.lines.get(v.top).map_or(0, |l| l.off),
-        };
-        let (id, cancel, progress, tx, src) = (
-            job.id,
-            job.cancel.clone(),
-            job.progress.clone(),
-            self.tx.clone(),
-            v.src.clone(),
-        );
-        thread::spawn(move || {
-            let res = search::find(&src, &m, pos, dir, &cancel, &progress);
-            let _ = tx.send(Msg::Found(id, dir, res));
-        });
-        v.loading = None;
-        v.searching = Some(job);
     }
 
     // ----- background results ----------------------------------------------
@@ -762,24 +887,10 @@ impl App {
                             let after = std::mem::replace(&mut v.after, After::Bottom);
                             self.apply_after(after);
                         }
-                        Err(e) => v.notice = err_text(&e),
-                    }
-                }
-                Msg::Found(id, dir, res) => {
-                    let Some(v) = &mut self.viewer else { continue };
-                    if v.searching.as_ref().map(|j| j.id) != Some(id) {
-                        continue;
-                    }
-                    v.searching = None;
-                    match res {
-                        Ok(Some(off)) => self.start_load(Target::Around(off), After::Match(off)),
-                        Ok(None) => {
-                            v.notice = match dir {
-                                Dir::Back => "No older match".into(),
-                                Dir::Fwd => "No newer match".into(),
-                            }
+                        Err(e) => {
+                            v.live = false;
+                            v.notice = err_text(&e);
                         }
-                        Err(e) => v.notice = err_text(&e),
                     }
                 }
             }
@@ -793,7 +904,7 @@ impl App {
         let Some(v) = &mut self.viewer else {
             return false;
         };
-        if !v.live {
+        if !v.live || v.loading.is_some() {
             self.backlog = false;
             return false;
         }
@@ -832,10 +943,19 @@ impl App {
                 return false;
             }
             v.last_poll = Instant::now();
-            match window::append_plain(path, &mut v.win) {
+            let filter = v.filter.clone();
+            match window::append_plain(path, &mut v.win, filter.as_deref()) {
                 Ok(Appended::Nothing) => {}
-                Ok(Appended::Grew) => changed = true,
+                Ok(Appended::Grew) => {
+                    v.win
+                        .trim_front(tail.max(rows), window::MAX_WINDOW_BYTES / 2);
+                    changed = true;
+                }
                 Ok(Appended::Reload) => {
+                    if filter.is_some() {
+                        self.start_load(Target::End, After::Bottom);
+                        return true;
+                    }
                     match window::load_plain(path, Target::End) {
                         Ok(w) => v.win = w,
                         Err(e) => v.notice = err_text(&e),
@@ -850,6 +970,7 @@ impl App {
             }
         }
         if changed {
+            let v = self.viewer.as_mut().unwrap();
             v.top = v.win.lines.len().saturating_sub(rows);
         }
         changed

@@ -10,6 +10,8 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::filter::{CHUNK, Filter};
+
 /// Longest line kept in one piece. Longer lines are split into several rows.
 pub const MAX_LINE: usize = 8 * 1024;
 /// Bytes read on each side of the target for seekable files.
@@ -174,6 +176,7 @@ pub fn load_stream(
     max_lines: usize,
     cancel: &AtomicBool,
     progress: &AtomicU64,
+    filter: Option<&Filter>,
 ) -> io::Result<Window> {
     let mut lr = LineReader::new(r, 0);
     let mut w = Window {
@@ -196,6 +199,9 @@ pub fn load_stream(
             eof = true;
             break;
         };
+        if filter.is_some_and(|f| !f.is_match(&buf)) {
+            continue;
+        }
         match target {
             Target::Start => {
                 if w.lines.len() >= max_lines || w.bytes + buf.len() > MAX_WINDOW_BYTES {
@@ -277,6 +283,168 @@ pub fn load_plain(path: &Path, target: Target) -> io::Result<Window> {
     Ok(w)
 }
 
+/// Matching lines found before `hi` (a line boundary), newest last.
+/// Reads the file backwards in chunks until `want` lines or the start.
+fn back_matches(
+    f: &mut File,
+    hi: u64,
+    want: usize,
+    filter: &Filter,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> io::Result<(Vec<Line>, bool)> {
+    let mut found: Vec<Line> = Vec::new(); // newest first while collecting
+    let mut bytes = 0usize;
+    let mut buf = vec![0u8; CHUNK];
+    let mut end = hi;
+    while end > 0 && found.len() < want && bytes < MAX_WINDOW_BYTES / 2 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let start = end.saturating_sub(CHUNK as u64);
+        let len = (end - start) as usize;
+        f.seek(SeekFrom::Start(start))?;
+        f.read_exact(&mut buf[..len])?;
+        // The first partial line belongs to the previous (earlier) chunk,
+        // unless one line fills the whole chunk.
+        let first = if start == 0 {
+            0
+        } else {
+            match memchr::memchr(b'\n', &buf[..len]) {
+                Some(i) if i + 1 < len => i + 1,
+                _ => 0,
+            }
+        };
+        let mut chunk_lines = Vec::new();
+        filter.for_each_match(&buf[first..len], |ls, line| {
+            chunk_lines.push(Line {
+                off: start + (first + ls) as u64,
+                data: line[..line.len().min(MAX_LINE)].into(),
+            });
+            true
+        });
+        for l in chunk_lines.into_iter().rev() {
+            if found.len() >= want {
+                break;
+            }
+            bytes += l.data.len();
+            found.push(l);
+        }
+        end = start + first as u64;
+        progress.store(hi - end, Ordering::Relaxed);
+    }
+    let reached_start = end == 0;
+    found.reverse();
+    Ok((found, reached_start))
+}
+
+/// Matching lines from `lo` (a line boundary) onwards. Returns them, whether
+/// the end of the file was reached, and the offset after the last complete
+/// line scanned.
+fn fwd_matches(
+    f: &mut File,
+    lo: u64,
+    want: usize,
+    filter: &Filter,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> io::Result<(Vec<Line>, bool, u64)> {
+    f.seek(SeekFrom::Start(lo))?;
+    let mut found = Vec::new();
+    let mut bytes = 0usize;
+    let mut reached_end = true;
+    let mut scanned = lo;
+    crate::filter::for_each_chunk(f, lo, cancel, |base, chunk| {
+        let complete = memchr::memrchr(b'\n', chunk).map_or(0, |i| i + 1);
+        let mut full = true;
+        filter.for_each_match(&chunk[..complete], |ls, line| {
+            if found.len() >= want || bytes >= MAX_WINDOW_BYTES / 2 {
+                full = false;
+                return false;
+            }
+            bytes += line.len().min(MAX_LINE);
+            found.push(Line {
+                off: base + ls as u64,
+                data: line[..line.len().min(MAX_LINE)].into(),
+            });
+            true
+        });
+        if !full {
+            reached_end = false;
+            return false;
+        }
+        scanned = base + complete as u64;
+        progress.store(scanned - lo, Ordering::Relaxed);
+        true
+    })?;
+    Ok((found, reached_end, scanned))
+}
+
+/// Offset just after the last newline of the file (the end of the last
+/// complete line), looking at most 1 MB back.
+fn last_line_end(f: &mut File, size: u64) -> io::Result<u64> {
+    let start = size.saturating_sub(CHUNK as u64);
+    let mut buf = vec![0u8; (size - start) as usize];
+    f.seek(SeekFrom::Start(start))?;
+    f.read_exact(&mut buf)?;
+    Ok(match memchr::memrchr(b'\n', &buf) {
+        Some(i) => start + i as u64 + 1,
+        None if start == 0 => 0,
+        None => size,
+    })
+}
+
+/// Loads a window holding only lines that match `filter`, reading a seekable
+/// file in 1 MB chunks around the target. Runs on a worker thread.
+pub fn load_plain_filtered(
+    path: &Path,
+    target: Target,
+    max_lines: usize,
+    filter: &Filter,
+    cancel: &AtomicBool,
+    progress: &AtomicU64,
+) -> io::Result<Window> {
+    let mut f = File::open(path)?;
+    let size = f.metadata()?.len();
+    let mut w = Window {
+        seen_size: size,
+        ..Default::default()
+    };
+    let (before, after) = match target {
+        Target::End => {
+            let hi = last_line_end(&mut f, size)?;
+            let (lines, at_start) = back_matches(&mut f, hi, max_lines, filter, cancel, progress)?;
+            w.at_start = at_start;
+            w.at_end = true;
+            w.end_off = hi;
+            (lines, Vec::new())
+        }
+        Target::Start => {
+            let (lines, at_end, scanned) =
+                fwd_matches(&mut f, 0, max_lines, filter, cancel, progress)?;
+            w.at_start = true;
+            w.at_end = at_end;
+            w.end_off = scanned;
+            (Vec::new(), lines)
+        }
+        Target::Around(t) => {
+            let t = t.min(size);
+            let (b, at_start) = back_matches(&mut f, t, max_lines / 2, filter, cancel, progress)?;
+            let (a, at_end, scanned) =
+                fwd_matches(&mut f, t, max_lines / 2, filter, cancel, progress)?;
+            w.at_start = at_start;
+            w.at_end = at_end;
+            w.end_off = scanned;
+            (b, a)
+        }
+    };
+    for l in before.into_iter().chain(after) {
+        w.bytes += l.data.len();
+        w.lines.push_back(l);
+    }
+    Ok(w)
+}
+
 pub enum Appended {
     Nothing,
     Grew,
@@ -285,13 +453,21 @@ pub enum Appended {
 }
 
 /// Appends newly written lines of a growing file to a window at its end.
-pub fn append_plain(path: &Path, w: &mut Window) -> io::Result<Appended> {
+/// With a filter only complete, matching lines are added.
+pub fn append_plain(path: &Path, w: &mut Window, filter: Option<&Filter>) -> io::Result<Appended> {
     let mut f = File::open(path)?;
     let size = f.metadata()?.len();
     if size == w.seen_size {
         return Ok(Appended::Nothing);
     }
-    if size < w.end_off || size - w.end_off > 2 * PLAIN_HALF {
+    // Filtered lines are cheap to skip, so a filtered view can absorb a much
+    // bigger burst before it is cheaper to reload from the end.
+    let max_burst = if filter.is_some() {
+        64 * CHUNK as u64
+    } else {
+        2 * PLAIN_HALF
+    };
+    if size < w.end_off || size - w.end_off > max_burst {
         return Ok(Appended::Reload);
     }
     w.seen_size = size;
@@ -302,7 +478,22 @@ pub fn append_plain(path: &Path, w: &mut Window) -> io::Result<Appended> {
     f.seek(SeekFrom::Start(w.end_off))?;
     let mut lr = LineReader::new(f, w.end_off);
     let mut buf = Vec::with_capacity(1024);
+    let mut changed = false;
     while let Some((off, terminated)) = lr.next_line(&mut buf)? {
+        if let Some(flt) = filter {
+            // Wait for the newline before judging a line.
+            if !terminated {
+                w.end_off = off;
+                break;
+            }
+            w.end_off = lr.off;
+            if flt.is_match(&buf) {
+                w.push(off, &buf);
+                changed = true;
+            }
+            continue;
+        }
+        changed = true;
         w.push(off, &buf);
         if terminated {
             w.end_off = lr.off;
@@ -313,6 +504,10 @@ pub fn append_plain(path: &Path, w: &mut Window) -> io::Result<Appended> {
         }
     }
     w.trim_front(usize::MAX, MAX_WINDOW_BYTES / 2);
+    w.at_end = true;
+    if !changed {
+        return Ok(Appended::Nothing);
+    }
     w.at_end = true;
     Ok(Appended::Grew)
 }
@@ -356,7 +551,7 @@ mod tests {
     fn over_long_lines_are_split_not_buffered() {
         let data = vec![b'x'; MAX_LINE * 2 + 5];
         let (c, p) = none();
-        let w = load_stream(&data[..], Target::End, 100, &c, &p).unwrap();
+        let w = load_stream(&data[..], Target::End, 100, &c, &p, None).unwrap();
         assert_eq!(w.lines.len(), 3);
         assert!(w.lines.iter().all(|l| l.data.len() <= MAX_LINE));
     }
@@ -365,14 +560,14 @@ mod tests {
     fn stream_windows_stay_bounded() {
         let data: String = (0..1000).map(|i| format!("line {i}\n")).collect();
         let (c, p) = none();
-        let end = load_stream(data.as_bytes(), Target::End, 10, &c, &p).unwrap();
+        let end = load_stream(data.as_bytes(), Target::End, 10, &c, &p, None).unwrap();
         assert_eq!(text(&end).first().unwrap(), "line 990");
         assert!(end.at_end && !end.at_start);
-        let start = load_stream(data.as_bytes(), Target::Start, 10, &c, &p).unwrap();
+        let start = load_stream(data.as_bytes(), Target::Start, 10, &c, &p, None).unwrap();
         assert_eq!(text(&start).last().unwrap(), "line 9");
         assert!(start.at_start && !start.at_end);
         let off = end.lines[0].off;
-        let mid = load_stream(data.as_bytes(), Target::Around(off), 10, &c, &p).unwrap();
+        let mid = load_stream(data.as_bytes(), Target::Around(off), 10, &c, &p, None).unwrap();
         assert_eq!(
             text(&mid),
             (985..995).map(|i| format!("line {i}")).collect::<Vec<_>>()
@@ -401,25 +596,85 @@ mod tests {
         write!(f, "appended\npartial").unwrap();
         f.flush().unwrap();
         assert!(matches!(
-            append_plain(&path, &mut w).unwrap(),
+            append_plain(&path, &mut w, None).unwrap(),
             Appended::Grew
         ));
         assert_eq!(text(&w).last().unwrap(), "partial");
         writeln!(f, " done").unwrap();
         f.flush().unwrap();
-        append_plain(&path, &mut w).unwrap();
+        append_plain(&path, &mut w, None).unwrap();
         let t = text(&w);
         assert_eq!(&t[t.len() - 2..], ["appended", "partial done"]);
         assert!(matches!(
-            append_plain(&path, &mut w).unwrap(),
+            append_plain(&path, &mut w, None).unwrap(),
             Appended::Nothing
         ));
 
         f.set_len(10).unwrap();
         assert!(matches!(
-            append_plain(&path, &mut w).unwrap(),
+            append_plain(&path, &mut w, None).unwrap(),
             Appended::Reload
         ));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn filtered_plain_windows() {
+        let path = std::env::temp_dir().join(format!("axtail-filter-{}.log", std::process::id()));
+        let mut f = File::create(&path).unwrap();
+        let mut hits = Vec::new();
+        let mut off = 0u64;
+        for i in 0..300_000 {
+            let line = if i % 1000 == 7 {
+                format!("{i} ERROR timeout\n")
+            } else {
+                format!("{i} INFO ok ok ok ok\n")
+            };
+            if line.contains("ERROR") {
+                hits.push(off);
+            }
+            off += line.len() as u64;
+            f.write_all(line.as_bytes()).unwrap();
+        }
+        write!(f, "partial ERROR").unwrap();
+        f.flush().unwrap();
+        let flt = Filter::parse("error").unwrap().unwrap();
+        let (c, p) = none();
+        let all: Vec<u64> = hits.clone();
+
+        let w = load_plain_filtered(&path, Target::End, 50, &flt, &c, &p).unwrap();
+        let offs: Vec<u64> = w.lines.iter().map(|l| l.off).collect();
+        assert_eq!(offs, all[all.len() - 50..]);
+        assert!(w.at_end && !w.at_start);
+
+        let w = load_plain_filtered(&path, Target::Start, 10, &flt, &c, &p).unwrap();
+        assert_eq!(w.lines.iter().map(|l| l.off).collect::<Vec<_>>(), all[..10]);
+        assert!(w.at_start && !w.at_end);
+
+        let mid = all[150];
+        let w = load_plain_filtered(&path, Target::Around(mid), 20, &flt, &c, &p).unwrap();
+        assert_eq!(
+            w.lines.iter().map(|l| l.off).collect::<Vec<_>>(),
+            all[140..160]
+        );
+
+        let all_found = load_plain_filtered(&path, Target::End, 10_000, &flt, &c, &p).unwrap();
+        assert_eq!(all_found.lines.len(), all.len());
+        assert!(all_found.at_start);
+
+        // Live append: the partial line counts once its newline arrives.
+        let mut w = load_plain_filtered(&path, Target::End, 5, &flt, &c, &p).unwrap();
+        writeln!(f, " now complete\nINFO skip\nERROR fresh").unwrap();
+        f.flush().unwrap();
+        assert!(matches!(
+            append_plain(&path, &mut w, Some(&flt)).unwrap(),
+            Appended::Grew
+        ));
+        let t = text(&w);
+        assert_eq!(
+            &t[t.len() - 2..],
+            ["partial ERROR now complete", "ERROR fresh"]
+        );
         std::fs::remove_file(&path).unwrap();
     }
 }

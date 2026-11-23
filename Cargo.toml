@@ -1,6 +1,6 @@
 [package]
 name = "axtail"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Advanced tail: a fast, read-only terminal log viewer for plain, gzip, zip and Docker logs"
 repository = "https://github.com/profawie/axtail"
@@ -13,6 +13,7 @@ flate2 = "1.1.11"
 memchr = "2.8.3"
 ratatui = "0.30.2"
 regex = "1.13.2"
+time = { version = "0.3.55", features = ["local-offset"] }
 zip = { version = "9.8.1", default-features = false, features = ["deflate"] }
 
 [profile.release]
