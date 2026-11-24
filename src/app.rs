@@ -16,6 +16,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 
 use crate::clock;
 use crate::filter::{self, Filter};
+use crate::hidden;
 use crate::source::{Killer, Scan, Source, natural_cmp};
 use crate::summary::{self, Report};
 use crate::ui;
@@ -173,6 +174,8 @@ pub struct Summary {
     /// Visible rows of the current tab: indices into its types or files.
     pub rows: Vec<usize>,
     pub detail: Option<Detail>,
+    /// A one-off note shown in the status bar until the next key.
+    pub notice: String,
     /// The files and time range the analysis covers.
     scope: (Vec<usize>, Option<usize>, String, String),
 }
@@ -234,6 +237,10 @@ pub struct App {
     pub screen: Screen,
     pub viewer: Option<Viewer>,
     pub summary: Option<Summary>,
+    /// Message types hidden from the summary, saved in hidden::path().
+    pub hidden: Vec<String>,
+    /// Types hidden in this session, latest last (Ctrl+Z shows them again).
+    undo_hide: Vec<String>,
     /// The viewer was opened from the summary: Esc goes back there.
     from_summary: bool,
     pub help: bool,
@@ -284,6 +291,14 @@ fn typed(key: &KeyEvent) -> Option<char> {
 }
 
 /// Removes the last word (and the spaces after it), like Ctrl+W in a shell.
+/// The first `max` characters of `s`, with an ellipsis when cut.
+fn clip_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}\u{2026}", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 fn delete_word(s: &mut String) {
     let trimmed = s.trim_end().len();
     s.truncate(trimmed);
@@ -317,6 +332,8 @@ impl App {
             screen: Screen::List,
             viewer: None,
             summary: None,
+            hidden: hidden::load(),
+            undo_hide: Vec::new(),
             from_summary: false,
             help: false,
             wrap: true,
@@ -684,8 +701,9 @@ impl App {
             done.clone(),
         );
         let total = srcs.len();
+        let hide = self.hidden.clone();
         thread::spawn(move || {
-            let report = summary::analyse(srcs, range, &cancel, &progress, &counter);
+            let report = summary::analyse(srcs, range, hide, &cancel, &progress, &counter);
             let _ = tx.send(Msg::Summary(id, report.map(Box::new)));
         });
         self.summary = Some(Summary {
@@ -699,8 +717,68 @@ impl App {
             query: old.map_or(String::new(), |s| s.query),
             rows: Vec::new(),
             detail: None,
+            notice: String::new(),
             scope,
         });
+    }
+
+    /// Hides a message type from the summary, saves it and analyses again.
+    fn hide_type(&mut self, level: usize, group: usize) {
+        let Some(pattern) = self
+            .summary
+            .as_ref()
+            .and_then(|s| s.report.as_ref())
+            .and_then(|r| r.groups[level].get(group))
+            .map(|g| g.pattern.clone())
+        else {
+            return;
+        };
+        if pattern.starts_with("(other messages:") {
+            return;
+        }
+        let saved = hidden::add(&pattern);
+        self.hidden.push(pattern.clone());
+        self.undo_hide.push(pattern.clone());
+        self.open_summary(true);
+        let note = match saved {
+            Ok(p) => format!(
+                "Hidden: {}  \u{b7}  Ctrl+Z undo  \u{b7}  saved in {}",
+                clip_chars(&pattern, 50),
+                p.file_name()
+                    .map_or(p.display().to_string(), |n| n.to_string_lossy().into())
+            ),
+            Err(e) => {
+                format!("Hidden for this session only (could not save: {e})  \u{b7}  Ctrl+Z undo")
+            }
+        };
+        if let Some(s) = &mut self.summary {
+            s.notice = note;
+        }
+    }
+
+    /// Shows the type hidden last in this session again.
+    fn unhide_last(&mut self) {
+        let Some(pattern) = self.undo_hide.pop() else {
+            if let Some(s) = &mut self.summary {
+                s.notice = match hidden::path() {
+                    Some(p) => format!(
+                        "Nothing to undo. Hidden types are listed in {}",
+                        p.display()
+                    ),
+                    None => "Nothing to undo".into(),
+                };
+            }
+            return;
+        };
+        self.hidden.retain(|h| *h != pattern);
+        let saved = hidden::remove(&pattern);
+        self.open_summary(true);
+        if let Some(s) = &mut self.summary {
+            s.notice = match saved {
+                Ok(_) => format!("Shown again: {}", clip_chars(&pattern, 60)),
+                Err(e) => format!("Shown again for this session (could not save: {e})"),
+            };
+        }
     }
 
     /// Filters and sorts the rows of the current summary tab.
@@ -746,6 +824,7 @@ impl App {
         }
         let page = self.rows.saturating_sub(8).max(1);
         let Some(s) = &mut self.summary else { return };
+        s.notice.clear();
         if let Some(c) = typed(&key) {
             if s.query.len() < 200 {
                 s.query.push(c);
@@ -807,6 +886,13 @@ impl App {
             }
             KeyCode::Char('r') if ctrl(&key, 'r') => self.open_summary(true),
             KeyCode::Char('l') if ctrl(&key, 'l') => self.screen = Screen::List,
+            KeyCode::Delete if s.tab != FILES_TAB && s.job.is_none() => {
+                if let Some(&row) = s.rows.get(*sel) {
+                    let tab = s.tab;
+                    self.hide_type(tab, row);
+                }
+            }
+            KeyCode::Char('z') if ctrl(&key, 'z') => self.unhide_last(),
             KeyCode::Backspace => {
                 s.query.pop();
                 self.rebuild_summary_rows();
@@ -841,9 +927,14 @@ impl App {
         let (Some(d), Some(r)) = (&mut s.detail, &s.report) else {
             return;
         };
+        s.notice.clear();
         let occ = &r.groups[d.level][d.group].occ;
         let last = occ.len().saturating_sub(1);
         match key.code {
+            KeyCode::Delete => {
+                let (level, group) = (d.level, d.group);
+                self.hide_type(level, group);
+            }
             KeyCode::Up => d.sel = d.sel.saturating_sub(1),
             KeyCode::Down => d.sel = (d.sel + 1).min(last),
             KeyCode::PageUp => d.sel = d.sel.saturating_sub(page),

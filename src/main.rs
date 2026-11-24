@@ -3,6 +3,7 @@
 mod app;
 mod clock;
 mod filter;
+mod hidden;
 mod source;
 mod summary;
 mod ui;
@@ -61,7 +62,9 @@ KEYS:
                 /regex/), Up/Down scroll, Enter live/pause, Esc back
     Summary     Ctrl+D analyses the listed logs: lines per level and errors
                 grouped into types; Tab next level, Enter details with every
-                timestamp, Enter again opens the log at that line
+                timestamp, Enter again opens the log at that line, Del hides a
+                message type (saved in ~/.config/axtail/hidden.txt or
+                %APPDATA%\\axtail\\hidden.txt; AXTAIL_HIDDEN sets another path)
     Anywhere    Ctrl+G help, Ctrl+X exit
 
 TIME ZONE:
