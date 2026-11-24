@@ -477,6 +477,20 @@ fn parse_line(b: &[u8], year: i32, not_after: i64) -> Parsed {
     }
 }
 
+/// True when a line continues the entry above it (a stack trace line), by
+/// the rule the analysis uses. `had_ts` records that the log has timestamps.
+pub fn continues(b: &[u8], year: i32, not_after: i64, had_ts: &mut bool) -> bool {
+    if b.first().is_none_or(|c| matches!(c, b' ' | b'\t')) {
+        return true;
+    }
+    let p = parse_line(b, year, not_after);
+    if p.ts.is_none() && *had_ts && !p.strong {
+        return true;
+    }
+    *had_ts |= p.ts.is_some();
+    false
+}
+
 // ----- message types -------------------------------------------------------
 
 /// Length of a quoted single token (no spaces) closed by `q`.

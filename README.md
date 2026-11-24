@@ -83,6 +83,13 @@ and every occurrence with timestamp, file and line. `Enter` again opens the log 
 
 ![Details of one error type with its occurrences](docs/screenshots/summary-details.png)
 
+**Export.** `Ctrl+A` saves every type of the level (all errors, say) to a Markdown report,
+`Ctrl+T` selects types (marked with a tick) and `Ctrl+E` saves only those. The report has
+each type's details, the full log line of every kept occurrence and every distinct stack
+trace in full. The bottom line shows where the file was saved.
+
+![Two error types selected and exported](docs/screenshots/summary-export.png)
+
 **Per file.** `Tab` walks through ERROR, WARN, INFO, DEBUG and a per-file breakdown.
 
 ![Level counts per file](docs/screenshots/summary-files.png)
@@ -103,6 +110,8 @@ and every occurrence with timestamp, file and line. `Enter` again opens the log 
   time, stack trace and every occurrence with timestamp, file and line. `Enter` on an
   occurrence opens the log at that exact line. Text and numbers only, colour-coded per level.
   `Del` hides a message type that is not a real problem, and remembers it.
+- **Error export.** `Ctrl+A` exports all error types, `Ctrl+T` + `Ctrl+E` only the ones you
+  select: a Markdown report with the details, full messages and full stack traces.
 - **File list with search and time range.** Type to search names, `Left`/`Right` to pick a
   time range (last 15 min ... 30 days), or `Tab` to type your own From / To date and time.
 - **Uncluttered screen.** The bottom line shows only the current state, a tip and the time
@@ -208,11 +217,32 @@ range, so for each folder the first file modified after "To" is listed too.
 | `Ctrl+R` | Analyse again |
 | `Del` | Hide the selected message type (saved, see below) |
 | `Ctrl+Z` | Show the type hidden last again |
+| `Ctrl+T` / `Insert` | Select the highlighted type for export (again to unselect) |
+| `Ctrl+E` | Export the selected types, or the highlighted one when none is selected |
+| `Ctrl+A` | Export all types of the current level (the search applies) |
 | `Esc` | Cancel a running analysis, clear the search, or go back to the list |
 
 In the details of a type: `Up` / `Down` select an occurrence, `Enter` opens the log at that
 line (highlighted, with `Esc` returning to the summary), `Left` / `Right` move to the
-previous / next type, `Del` hides the type and `Esc` goes back.
+previous / next type, `Ctrl+T` selects the type, `Ctrl+E` exports it (or the selected
+types), `Ctrl+A` exports all types of its level, `Del` hides the type and `Esc` goes back.
+
+**Exporting message types.** The export is a Markdown file (`.md`), readable as plain text
+or in any Markdown viewer, named like `axtail-error-all-20261124-213947.md` or
+`axtail-error-selected-20261124-213950.md`. It is saved in the folder axtail was started
+from, or in the folder named by the `AXTAIL_EXPORT_DIR` environment variable (if the
+current folder is not writable: the home folder, then the temp folder). The full path is
+shown at the bottom of the screen when it is done. For each type it holds:
+
+- the type, level, count, number of files, first and last time, span
+- the files of its occurrences, and the latest message in full
+- every distinct stack trace (or throw) in full, up to 500 lines each, with how many
+  occurrences share it; traces that differ only in numbers or ids count as one
+- every kept occurrence (the latest 300 per type): time, file, line, which stack trace,
+  and the full log line
+
+The summary keeps only a short preview of each message, so the export reads the needed
+files again (with progress at the bottom; `Esc` cancels). Hidden types are not exported.
 
 **Hiding message types.** A message that is not really a problem, say a warning your app
 always prints, can be hidden with `Del`. It disappears from the counts and lists, the table

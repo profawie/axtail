@@ -4,6 +4,7 @@
 //! a lot of data (filtered windows, stream windows, match counts) runs on a
 //! worker thread that can be cancelled and reports progress.
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -15,6 +16,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::clock;
+use crate::export;
 use crate::filter::{self, Filter};
 use crate::hidden;
 use crate::source::{Killer, Scan, Source, natural_cmp};
@@ -42,6 +44,8 @@ enum Msg {
     Count(usize, io::Result<u64>),
     /// A finished analysis; None when it was cancelled.
     Summary(u64, Option<Box<Report>>),
+    /// A finished export; None when it was cancelled.
+    Export(u64, Option<Result<export::Done, String>>),
 }
 
 /// Background reader for a live docker stream. Lines are filtered on that
@@ -176,6 +180,12 @@ pub struct Summary {
     pub detail: Option<Detail>,
     /// A one-off note shown in the status bar until the next key.
     pub notice: String,
+    /// Message types selected for export: (level, group).
+    pub marked: HashSet<(usize, usize)>,
+    /// The running export, files read so far and files to read.
+    pub export: Option<Job>,
+    pub export_done: Arc<AtomicU64>,
+    pub export_total: usize,
     /// The files and time range the analysis covers.
     scope: (Vec<usize>, Option<usize>, String, String),
 }
@@ -603,7 +613,10 @@ impl App {
                 .as_ref()
                 .is_some_and(|v| v.query_changed.is_some());
             let busy = self.viewer.as_ref().is_some_and(|v| v.loading.is_some())
-                || self.summary.as_ref().is_some_and(|s| s.job.is_some());
+                || self
+                    .summary
+                    .as_ref()
+                    .is_some_and(|s| s.job.is_some() || s.export.is_some());
             let timeout = Duration::from_millis(if self.backlog {
                 0
             } else if busy || typing {
@@ -718,6 +731,10 @@ impl App {
             rows: Vec::new(),
             detail: None,
             notice: String::new(),
+            marked: HashSet::new(),
+            export: None,
+            export_done: Arc::new(AtomicU64::new(0)),
+            export_total: 0,
             scope,
         });
     }
@@ -779,6 +796,134 @@ impl App {
                 Err(e) => format!("Shown again for this session (could not save: {e})"),
             };
         }
+    }
+
+    /// Selects or unselects a message type for export.
+    fn toggle_mark(&mut self, level: usize, group: usize) {
+        let Some(s) = &mut self.summary else { return };
+        if !s.marked.remove(&(level, group)) {
+            s.marked.insert((level, group));
+        }
+        s.notice = match s.marked.len() {
+            0 => "No type selected".into(),
+            n => format!(
+                "{n} type{} selected  \u{b7}  Ctrl+E exports {}",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "it" } else { "them" }
+            ),
+        };
+    }
+
+    /// Exports message types to a Markdown report on a worker thread.
+    /// `all`: every type listed in the current view. Otherwise the selected
+    /// types, or the highlighted one when none is selected.
+    fn start_export(&mut self, all: bool) {
+        let range = match self.preset {
+            Some(i) => PRESETS[i].0.to_string(),
+            None => format!(
+                "{} to {}",
+                if self.from_text.trim().is_empty() {
+                    "start"
+                } else {
+                    self.from_text.trim()
+                },
+                if self.to_text.trim().is_empty() {
+                    "now"
+                } else {
+                    self.to_text.trim()
+                }
+            ),
+        };
+        let job = self.new_job();
+        let (title, sources, tx) = (self.title.clone(), self.sources.clone(), self.tx.clone());
+        let Some(s) = &mut self.summary else { return };
+        let Some(r) = &s.report else { return };
+        if s.job.is_some() || s.export.is_some() {
+            return;
+        }
+        let detail = s.detail.as_ref().map(|d| (d.level, d.group));
+        let level = detail.map_or(s.tab, |d| d.0);
+        let by_count = |v: &mut Vec<(usize, usize)>| {
+            v.sort_by_key(|&(lv, g)| (lv, std::cmp::Reverse(r.groups[lv][g].count)))
+        };
+        let picks: Vec<(usize, usize)> = if all {
+            if level == FILES_TAB {
+                s.notice = "Pick a level with Tab (ERROR, WARN, ...) to export its types".into();
+                return;
+            }
+            s.rows.iter().map(|&g| (level, g)).collect()
+        } else if !s.marked.is_empty() {
+            let mut v: Vec<_> = s.marked.iter().copied().collect();
+            by_count(&mut v);
+            v
+        } else if let Some(d) = detail {
+            vec![d]
+        } else if let Some(&g) = s.rows.get(s.sel[s.tab]).filter(|_| s.tab != FILES_TAB) {
+            vec![(s.tab, g)]
+        } else {
+            s.notice = "Select a message type first (Ctrl+T)".into();
+            return;
+        };
+        if picks.is_empty() {
+            s.notice = "Nothing to export".into();
+            return;
+        }
+        let one_level = picks.iter().all(|p| p.0 == picks[0].0);
+        let lv_name = if one_level {
+            summary::LEVEL_NAMES[picks[0].0]
+        } else {
+            ""
+        };
+        let n = picks.len();
+        let plural = if n == 1 { "" } else { "s" };
+        let what = if all {
+            let mut w = format!("all {n} {lv_name} type{plural}");
+            if !s.query.trim().is_empty() {
+                w.push_str(&format!(" matching \"{}\"", s.query.trim()));
+            }
+            w
+        } else if one_level {
+            format!("{n} selected {lv_name} type{plural}")
+        } else {
+            format!("{n} selected type{plural}")
+        };
+        let items: Vec<export::Item> = picks
+            .iter()
+            .map(|&(lv, g)| export::Item::new(lv, &r.groups[lv][g]))
+            .collect();
+        let files: HashSet<usize> = items
+            .iter()
+            .flat_map(|i| i.occ.iter().map(|o| o.src))
+            .collect();
+        let req = export::Request {
+            title,
+            what,
+            range,
+            search: if all {
+                s.query.trim().to_string()
+            } else {
+                String::new()
+            },
+            analysed_files: r.files.len(),
+            totals: r.totals,
+            items,
+            sources,
+            path: export::target(if one_level { lv_name } else { "mixed" }, !all),
+        };
+        let done = Arc::new(AtomicU64::new(0));
+        let (id, cancel, progress, counter) = (
+            job.id,
+            job.cancel.clone(),
+            job.progress.clone(),
+            done.clone(),
+        );
+        thread::spawn(move || {
+            let res = export::run(req, &cancel, &progress, &counter);
+            let _ = tx.send(Msg::Export(id, res));
+        });
+        s.export = Some(job);
+        s.export_done = done;
+        s.export_total = files.len();
     }
 
     /// Filters and sorts the rows of the current summary tab.
@@ -893,6 +1038,21 @@ impl App {
                 }
             }
             KeyCode::Char('z') if ctrl(&key, 'z') => self.unhide_last(),
+            KeyCode::Char('t') | KeyCode::Insert
+                if (ctrl(&key, 't') || key.code == KeyCode::Insert) && s.tab != FILES_TAB =>
+            {
+                if let Some(&row) = s.rows.get(*sel) {
+                    *sel = (*sel + 1).min(last);
+                    let tab = s.tab;
+                    self.toggle_mark(tab, row);
+                }
+            }
+            KeyCode::Char('e') if ctrl(&key, 'e') => self.start_export(false),
+            KeyCode::Char('a') if ctrl(&key, 'a') => self.start_export(true),
+            KeyCode::Esc if s.export.is_some() => {
+                s.export = None;
+                s.notice = "Export cancelled".into();
+            }
             KeyCode::Backspace => {
                 s.query.pop();
                 self.rebuild_summary_rows();
@@ -969,6 +1129,18 @@ impl App {
             KeyCode::Char('l') if ctrl(&key, 'l') => {
                 s.detail = None;
                 self.screen = Screen::List;
+            }
+            KeyCode::Char('t') | KeyCode::Insert
+                if ctrl(&key, 't') || key.code == KeyCode::Insert =>
+            {
+                let (level, group) = (d.level, d.group);
+                self.toggle_mark(level, group);
+            }
+            KeyCode::Char('e') if ctrl(&key, 'e') => self.start_export(false),
+            KeyCode::Char('a') if ctrl(&key, 'a') => self.start_export(true),
+            KeyCode::Esc if s.export.is_some() => {
+                s.export = None;
+                s.notice = "Export cancelled".into();
             }
             KeyCode::Esc | KeyCode::Backspace => s.detail = None,
             _ => {}
@@ -1350,6 +1522,40 @@ impl App {
                     s.job = None;
                     s.report = report;
                     self.rebuild_summary_rows();
+                }
+                Msg::Export(id, res) => {
+                    let Some(s) = &mut self.summary else { continue };
+                    if s.export.as_ref().map(|j| j.id) != Some(id) {
+                        continue;
+                    }
+                    s.export = None;
+                    s.notice = match res {
+                        Some(Ok(d)) => {
+                            let mut n = format!(
+                                "Exported {} type{} ({} occurrences) to {}",
+                                d.types,
+                                if d.types == 1 { "" } else { "s" },
+                                d.entries,
+                                d.path.display()
+                            );
+                            if !d.errors.is_empty() {
+                                n.push_str(&format!(
+                                    "  \u{b7}  could not read {} file{} again (listed in the report)",
+                                    d.errors.len(),
+                                    if d.errors.len() == 1 { "" } else { "s" }
+                                ));
+                            } else if d.missing > 0 {
+                                n.push_str(&format!(
+                                    "  \u{b7}  {} line{} could not be read again",
+                                    d.missing,
+                                    if d.missing == 1 { "" } else { "s" }
+                                ));
+                            }
+                            n
+                        }
+                        Some(Err(e)) => format!("Export failed: {e}"),
+                        None => "Export cancelled".into(),
+                    };
                 }
                 Msg::Window(id, res) => {
                     let Some(v) = &mut self.viewer else { continue };
