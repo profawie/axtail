@@ -538,11 +538,17 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App, s: &Summary, r: &Report) {
     let title = if files {
         format!(" FILES \u{b7} {} analysed ", s.rows.len())
     } else {
+        let hidden = r.hidden_types[s.tab];
         format!(
-            " {} \u{b7} {} message type{} ",
+            " {} \u{b7} {} message type{}{} ",
             LEVEL_NAMES[s.tab],
             s.rows.len(),
-            if s.rows.len() == 1 { "" } else { "s" }
+            if s.rows.len() == 1 { "" } else { "s" },
+            if hidden > 0 {
+                format!(" \u{b7} {hidden} hidden")
+            } else {
+                String::new()
+            }
         )
     };
     let block = Block::bordered()
@@ -1113,15 +1119,21 @@ fn draw_status(
                     s.total,
                     human(job.progress.load(Ordering::Relaxed))
                 )));
+            } else if !s.notice.is_empty() {
+                left.push(badge("NOTE", Color::LightMagenta));
+                left.push(Span::styled(
+                    format!(" {}", s.notice),
+                    Style::new().fg(Color::LightCyan),
+                ));
             } else if let Some(d) = &s.detail {
                 left.push(badge("DETAILS", TAB_COLORS[d.level]));
-                left.push(tip("\u{2191}\u{2193} select  \u{b7}  Enter open the log at that line  \u{b7}  \u{2190}\u{2192} other types  \u{b7}  Esc back"));
+                left.push(tip("\u{2191}\u{2193} select  \u{b7}  Enter open the log at that line  \u{b7}  \u{2190}\u{2192} other types  \u{b7}  Del hide type  \u{b7}  Esc back"));
             } else {
                 left.push(badge("SUMMARY", Color::LightMagenta));
                 left.push(tip(if s.tab == FILES_TAB {
                     "Tab next view  \u{b7}  \u{2191}\u{2193} select  \u{b7}  Enter open the log  \u{b7}  \u{2190}\u{2192} time range"
                 } else {
-                    "Tab next level  \u{b7}  \u{2191}\u{2193} select  \u{b7}  Enter details  \u{b7}  \u{2190}\u{2192} time range"
+                    "Tab next level  \u{b7}  \u{2191}\u{2193} select  \u{b7}  Enter details  \u{b7}  Del hide type  \u{b7}  \u{2190}\u{2192} time range"
                 }));
             }
         }
@@ -1269,6 +1281,11 @@ fn draw_help(f: &mut Frame, area: Rect, screen: Screen) {
         row("type", "search message types or file names"),
         row("\u{2190} \u{2192}", "time range (analyses again)"),
         row("Ctrl+S / Ctrl+R", "sort types / analyse again"),
+        row("Del / Ctrl+Z", "hide a message type (saved) / undo"),
+        row(
+            "  hidden types",
+            &crate::hidden::path().map_or("no config folder".into(), |p| p.display().to_string()),
+        ),
         row("Esc", "back"),
     ];
     let list = vec![

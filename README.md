@@ -102,6 +102,7 @@ and every occurrence with timestamp, file and line. `Enter` again opens the log 
   INFO, DEBUG), messages grouped into types, and for each type the count, first and last
   time, stack trace and every occurrence with timestamp, file and line. `Enter` on an
   occurrence opens the log at that exact line. Text and numbers only, colour-coded per level.
+  `Del` hides a message type that is not a real problem, and remembers it.
 - **File list with search and time range.** Type to search names, `Left`/`Right` to pick a
   time range (last 15 min ... 30 days), or `Tab` to type your own From / To date and time.
 - **Uncluttered screen.** The bottom line shows only the current state, a tip and the time
@@ -205,11 +206,26 @@ range, so for each folder the first file modified after "To" is listed too.
 | `Left` / `Right` | Time range (the analysis runs again) |
 | `Ctrl+S` | Sort types: count, last seen, first seen |
 | `Ctrl+R` | Analyse again |
+| `Del` | Hide the selected message type (saved, see below) |
+| `Ctrl+Z` | Show the type hidden last again |
 | `Esc` | Cancel a running analysis, clear the search, or go back to the list |
 
 In the details of a type: `Up` / `Down` select an occurrence, `Enter` opens the log at that
 line (highlighted, with `Esc` returning to the summary), `Left` / `Right` move to the
-previous / next type and `Esc` goes back.
+previous / next type, `Del` hides the type and `Esc` goes back.
+
+**Hiding message types.** A message that is not really a problem, say a warning your app
+always prints, can be hidden with `Del`. It disappears from the counts and lists, the table
+title shows how many types are hidden, and it stays hidden in later runs. Hidden types are
+saved one per line in a text file (the path is shown in `Ctrl+G` help):
+
+- Linux: `~/.config/axtail/hidden.txt` (or `$XDG_CONFIG_HOME/axtail/hidden.txt`)
+- Windows: `%APPDATA%\axtail\hidden.txt`
+- Any system: the path in the `AXTAIL_HIDDEN` environment variable
+
+A type is hidden when it contains a line of the file, so a line can also be written by
+hand as part of a message, such as `Picked up JAVA_TOOL_OPTIONS`. Delete a line to show
+that type again; lines starting with `#` are comments.
 
 How the summary reads a log:
 
@@ -222,6 +238,8 @@ How the summary reads a log:
   zone, `22/Nov/2026:13:05:09 +0800`, syslog `Nov 22 13:05:09`, and JSON `time` / `ts`
   fields. A timestamp without a zone is taken to be in the zone shown at the bottom right
   (`--tz` changes it).
+- Level words that are part of a command-line option are ignored, so JVM startup notices
+  like `Picked up JAVA_TOOL_OPTIONS: -XX:+ExitOnOutOfMemoryError` are not errors.
 - Lines that follow an entry without a timestamp of their own (stack traces) belong to
   that entry and are not counted separately.
 - Placeholders in a type: `<n>` number, `<ip>` address, `<uuid>`, `<hex>`, `<id>` generated

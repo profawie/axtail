@@ -85,6 +85,9 @@ pub struct Report {
     pub last: Option<i64>,
     pub level_last: [Option<i64>; 4],
     pub groups: [Vec<Group>; 4],
+    /// Entries and distinct types left out because the user hid them.
+    pub hidden: [u64; 4],
+    pub hidden_types: [u64; 4],
     /// The level has more distinct types than are kept.
     pub capped: [bool; 4],
     /// Entries left out because they are outside the time range.
@@ -270,6 +273,17 @@ struct Found {
     strip: Option<usize>,
 }
 
+/// The word at `i` belongs to a command-line option such as
+/// `-XX:+ExitOnOutOfMemoryError` or `--on-error=retry`, as printed by
+/// "Picked up JAVA_TOOL_OPTIONS: ..." and similar startup notices.
+fn in_option(b: &[u8], i: usize) -> bool {
+    let start = b[..i]
+        .iter()
+        .rposition(|c| c.is_ascii_whitespace() || *c == b'"' || *c == b'\'')
+        .map_or(0, |p| p + 1);
+    b[start] == b'-' && i > start
+}
+
 /// Looks for the first level word in the 160 bytes after `from`.
 fn find_level(b: &[u8], from: usize) -> Option<Found> {
     let glue = |c: u8, extra: &[u8]| c.is_ascii_alphanumeric() || extra.contains(&c);
@@ -289,7 +303,11 @@ fn find_level(b: &[u8], from: usize) -> Option<Found> {
         if let Some((level, strong)) = word_level(&b[i..j]) {
             // Part of a path, a key or an identifier: not a level.
             let free = !glue(prev, b"_/.-\\") && !glue(next, b"_/.-\\=");
-            if !strong && !next.is_ascii_digit() && next != b'_' {
+            if in_option(b, i) {
+                i = j;
+                continue;
+            }
+            if !strong && !next.is_ascii_digit() && !b"_=".contains(&next) && prev != b'+' {
                 return Some(Found {
                     level,
                     strong,
@@ -618,10 +636,15 @@ pub struct Analyzer {
     occ_bytes: usize,
     range: (Option<i64>, Option<i64>),
     pat: String,
+    /// Hidden message types: a type containing one of these is left out.
+    hide: Vec<String>,
 }
 
+/// Group index of a hidden type.
+const HIDDEN: usize = usize::MAX;
+
 impl Analyzer {
-    pub fn new(range: (Option<i64>, Option<i64>)) -> Analyzer {
+    pub fn new(range: (Option<i64>, Option<i64>), hide: Vec<String>) -> Analyzer {
         Analyzer {
             report: Report::default(),
             index: Default::default(),
@@ -629,6 +652,7 @@ impl Analyzer {
             occ_bytes: 0,
             range,
             pat: String::new(),
+            hide,
         }
     }
 
@@ -636,6 +660,11 @@ impl Analyzer {
     fn group(&mut self, lv: usize) -> (usize, bool) {
         if let Some(&g) = self.index[lv].get(self.pat.as_str()) {
             return (g, false);
+        }
+        if self.hide.iter().any(|h| self.pat.contains(h.as_str())) {
+            self.report.hidden_types[lv] += 1;
+            self.index[lv].insert(self.pat.clone(), HIDDEN);
+            return (HIDDEN, false);
         }
         let groups = &mut self.report.groups[lv];
         let new = |pattern: String| Group {
@@ -729,11 +758,6 @@ impl Analyzer {
                 continue;
             };
             let lv = level as usize;
-            stat.counts[lv] += 1;
-            if let Some(t) = ts {
-                let l = &mut self.report.level_last[lv];
-                *l = Some(l.map_or(t, |x| x.max(t)));
-            }
             self.pat.clear();
             let text = match p.msg {
                 Msg::Range(s, e) => sanitize(&buf[s..e]),
@@ -746,6 +770,15 @@ impl Analyzer {
             let skip = self.pat.len();
             normalize(&text[skip..], &mut self.pat);
             let (gi, created) = self.group(lv);
+            if gi == HIDDEN {
+                self.report.hidden[lv] += 1;
+                continue;
+            }
+            stat.counts[lv] += 1;
+            if let Some(t) = ts {
+                let l = &mut self.report.level_last[lv];
+                *l = Some(l.map_or(t, |x| x.max(t)));
+            }
             let g = &mut self.report.groups[lv][gi];
             g.count += 1;
             if let Some(t) = ts {
@@ -801,13 +834,14 @@ impl Analyzer {
 pub fn analyse(
     sources: Vec<(usize, Source)>,
     range: (Option<i64>, Option<i64>),
+    hide: Vec<String>,
     cancel: &AtomicBool,
     progress: &AtomicU64,
     done: &AtomicU64,
 ) -> Option<Report> {
     let start = Instant::now();
     let now = clock::now_secs();
-    let mut a = Analyzer::new(range);
+    let mut a = Analyzer::new(range, hide);
     for (src, source) in sources {
         if cancel.load(Ordering::Relaxed) {
             return None;
@@ -930,6 +964,21 @@ mod tests {
             parse("java.lang.NullPointerException: boom").1,
             Some(Level::Error)
         );
+        // JVM startup notices and option names are not errors.
+        assert_eq!(
+            parse("Picked up JAVA_TOOL_OPTIONS: -Xmx2g -XX:+ExitOnOutOfMemoryError").1,
+            None
+        );
+        assert_eq!(
+            parse("Picked up _JAVA_OPTIONS: -XX:OnOutOfMemoryError=\"kill -9 %p\"").1,
+            None
+        );
+        assert_eq!(parse("starting with --log-level=error --verbose").1, None);
+        assert_eq!(parse("flag +HeapDumpOnOutOfMemoryError set").1, None);
+        assert_eq!(
+            parse("2026-11-22 10:00:01 - ERROR - disk full").1,
+            Some(Level::Error)
+        );
     }
 
     #[test]
@@ -946,8 +995,8 @@ java.net.SocketTimeoutException: connect timed out
 no level here
 ";
         let (c, p) = (AtomicBool::new(false), AtomicU64::new(0));
-        let run = |range| {
-            let mut a = Analyzer::new(range);
+        let run = |range, hide: &[&str]| {
+            let mut a = Analyzer::new(range, hide.iter().map(|h| h.to_string()).collect());
             let mut stat = FileStat {
                 src: 0,
                 lines: 0,
@@ -959,7 +1008,7 @@ no level here
             a.report.files.push(stat);
             a.finish()
         };
-        let r = run((None, None));
+        let r = run((None, None), &[]);
         assert_eq!(r.lines, 9);
         assert_eq!(r.totals, [3, 1, 1, 1, 0]);
         let errors = &r.groups[0];
@@ -973,8 +1022,15 @@ no level here
         assert!(g.occ[1].text.contains("10.0.0.9"));
 
         let from = clock::civil_to_unix(2026, 11, 22, 10, 0, 3, clock::offset_secs());
-        let r = run((from, None));
+        let r = run((from, None), &[]);
         assert_eq!(r.totals, [2, 1, 0, 0, 0]);
         assert_eq!(r.skipped, 3);
+
+        // A hidden type is left out of the counts and the list.
+        let r = run((None, None), &["timed out after"]);
+        assert_eq!(r.totals, [1, 1, 1, 1, 0]);
+        assert_eq!((r.hidden[0], r.hidden_types[0]), (2, 1));
+        assert_eq!(r.groups[0].len(), 1);
+        assert_eq!(r.groups[0][0].pattern, "Payment <n> declined");
     }
 }
