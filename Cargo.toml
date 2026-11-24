@@ -1,6 +1,6 @@
 [package]
 name = "axtail"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Advanced tail: a fast, read-only terminal log viewer for plain, gzip, zip and Docker logs"
 repository = "https://github.com/profawie/axtail"

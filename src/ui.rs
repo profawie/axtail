@@ -278,7 +278,7 @@ const TABLE_HEAD: Style = Style::new()
     .add_modifier(Modifier::BOLD.union(Modifier::UNDERLINED));
 
 /// 1234567 -> "1,234,567".
-fn commas(n: u64) -> String {
+pub fn commas(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
@@ -290,12 +290,12 @@ fn commas(n: u64) -> String {
     out
 }
 
-fn stamp(t: Option<i64>) -> String {
+pub fn stamp(t: Option<i64>) -> String {
     t.map_or("-".into(), clock::format_secs)
 }
 
 /// "3d 4h", "2h 5m", "40s": how long a type has been occurring.
-fn span_text(secs: i64) -> String {
+pub fn span_text(secs: i64) -> String {
     match secs {
         ..60 => format!("{secs}s"),
         60..3600 => format!("{}m {}s", secs / 60, secs % 60),
@@ -381,6 +381,14 @@ fn draw_summary_bar(f: &mut Frame, area: Rect, app: &App, s: &Summary) {
             Span::raw(format!("type {at} of {}", s.rows.len())),
         ];
         left.extend(time);
+        if s.marked.contains(&(d.level, d.group)) {
+            right.push(Span::styled(
+                "\u{2713} selected  ",
+                Style::new()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         right.push(Span::styled(
             format!("{} occurrences ", commas(r.groups[d.level][d.group].count)),
             Style::new().fg(color),
@@ -539,13 +547,19 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App, s: &Summary, r: &Report) {
         format!(" FILES \u{b7} {} analysed ", s.rows.len())
     } else {
         let hidden = r.hidden_types[s.tab];
+        let marked = s.marked.len();
         format!(
-            " {} \u{b7} {} message type{}{} ",
+            " {} \u{b7} {} message type{}{}{} ",
             LEVEL_NAMES[s.tab],
             s.rows.len(),
             if s.rows.len() == 1 { "" } else { "s" },
             if hidden > 0 {
                 format!(" \u{b7} {hidden} hidden")
+            } else {
+                String::new()
+            },
+            if marked > 0 {
+                format!(" \u{b7} {marked} selected")
             } else {
                 String::new()
             }
@@ -633,9 +647,18 @@ fn draw_summary(f: &mut Frame, area: Rect, app: &App, s: &Summary, r: &Report) {
             let g = &groups[i];
             let on = row == sel;
             let pick = |style: Style| if on { SELECTED } else { style };
+            let mark = s.marked.contains(&(s.tab, i));
             let mut spans = vec![
                 Span::styled(
-                    format!(" {:>10}", commas(g.count)),
+                    if mark { "\u{2713}" } else { " " },
+                    pick(
+                        Style::new()
+                            .fg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ),
+                Span::styled(
+                    format!("{:>10}", commas(g.count)),
                     pick(Style::new().fg(color).add_modifier(Modifier::BOLD)),
                 ),
                 Span::styled(
@@ -1119,6 +1142,14 @@ fn draw_status(
                     s.total,
                     human(job.progress.load(Ordering::Relaxed))
                 )));
+            } else if let Some(job) = &s.export {
+                left.push(badge("EXPORTING", Color::LightGreen));
+                left.push(tip(&format!(
+                    "reading {} of {} files again  \u{b7}  {} read  \u{b7}  Esc cancels",
+                    (s.export_done.load(Ordering::Relaxed) + 1).min(s.export_total as u64),
+                    s.export_total,
+                    human(job.progress.load(Ordering::Relaxed))
+                )));
             } else if !s.notice.is_empty() {
                 left.push(badge("NOTE", Color::LightMagenta));
                 left.push(Span::styled(
@@ -1127,13 +1158,13 @@ fn draw_status(
                 ));
             } else if let Some(d) = &s.detail {
                 left.push(badge("DETAILS", TAB_COLORS[d.level]));
-                left.push(tip("\u{2191}\u{2193} select  \u{b7}  Enter open the log at that line  \u{b7}  \u{2190}\u{2192} other types  \u{b7}  Del hide type  \u{b7}  Esc back"));
+                left.push(tip("Enter open log  \u{b7}  \u{2190}\u{2192} other types  \u{b7}  ^T select  \u{b7}  ^E export  \u{b7}  Del hide  \u{b7}  Esc back"));
             } else {
                 left.push(badge("SUMMARY", Color::LightMagenta));
                 left.push(tip(if s.tab == FILES_TAB {
                     "Tab next view  \u{b7}  \u{2191}\u{2193} select  \u{b7}  Enter open the log  \u{b7}  \u{2190}\u{2192} time range"
                 } else {
-                    "Tab next level  \u{b7}  \u{2191}\u{2193} select  \u{b7}  Enter details  \u{b7}  Del hide type  \u{b7}  \u{2190}\u{2192} time range"
+                    "Tab level  \u{b7}  Enter details  \u{b7}  ^T select  \u{b7}  ^E export selected  \u{b7}  ^A export all  \u{b7}  Del hide"
                 }));
             }
         }
@@ -1222,6 +1253,12 @@ fn draw_status(
         Span::styled(" ^X ", Style::new().fg(Color::Black).bg(Color::Gray)),
         Span::styled(" Exit ", Style::new().fg(Color::Gray)),
     ]);
+    // A summary note (such as where an export was saved) gets the whole bar.
+    if summary.is_some_and(|s| s.job.is_none() && s.export.is_none() && !s.notice.is_empty())
+        && viewer.is_none()
+    {
+        right.clear();
+    }
     two_sided(f, area, left, right);
 }
 
@@ -1282,6 +1319,16 @@ fn draw_help(f: &mut Frame, area: Rect, screen: Screen) {
         row("\u{2190} \u{2192}", "time range (analyses again)"),
         row("Ctrl+S / Ctrl+R", "sort types / analyse again"),
         row("Del / Ctrl+Z", "hide a message type (saved) / undo"),
+        row(
+            "Ctrl+T / Insert",
+            "select a message type for export (again: unselect)",
+        ),
+        row(
+            "Ctrl+E",
+            "export the selected types (or the highlighted one)",
+        ),
+        row("Ctrl+A", "export all types of the level (search applied)"),
+        row("  export folder", "current folder, or $AXTAIL_EXPORT_DIR"),
         row(
             "  hidden types",
             &crate::hidden::path().map_or("no config folder".into(), |p| p.display().to_string()),
